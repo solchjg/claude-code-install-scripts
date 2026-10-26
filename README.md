@@ -34,3 +34,4 @@ Each guide comes as Markdown and as a PDF with the same content.
 | --- | --- |
 | `Claude_Code_LXC_Use_and_Best_Practices` (.md / .pdf) | Using and maintaining the Proxmox LXC deployment. |
 | `Claude_Code_Lubuntu_Use_and_Best_Practices` (.md / .pdf) | Using and maintaining the Lubuntu deployment. |
+| `Claude_Code_Raspberry_Pi_Use_and_Best_Practices` (.md / .pdf) | Using and maintaining the Raspberry Pi 4 and Pi 5 deployments. |

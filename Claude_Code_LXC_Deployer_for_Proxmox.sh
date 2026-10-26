@@ -27,11 +27,26 @@
 #   agentic-errorlog    copies update/health WARN/FAIL lines to Agentic-Errors.txt
 #                       (+ optional ntfy push, set in /etc/agentic/ntfy.conf)
 #   claude (as root)    a stub that refuses and points at the user
+#
+# Where things live (inside the container unless noted):
+#   /etc/agentic/users.conf      the Claude user and the deploy-time choices the
+#                                tools read (agentic-update/-doctor/-setup-user)
+#   /etc/agentic/ntfy.conf       ntfy alert settings (root-only, 0600)
+#   /usr/local/share/agentic/    shared Claude settings template, shell block and
+#                                the staged webapp-testing skill
+#   ~USER/.claude/settings.json  the user's Claude Code settings (auto mode + the
+#                                deny floor); never overwritten by a re-run
+#   /project/CLAUDE.md           what Claude is told about this box
+#   ~USER/Agentic-Errors.txt     WARN/FAIL lines from agentic-update/-doctor
+#   /var/log/agentic-provision.log, /var/log/agentic-update.log   logs
+#   /var/log/agentic-deploy/     on the Proxmox HOST: one log per deploy run
+#   Proxmox UI → container → Notes   the notes card (connect, update, health)
 # ============================================================================
 
 set -euo pipefail
 
 # ── Colors & Helpers ────────────────────────────────────────────────────────
+# ANSI colour codes for the console messages (NC = back to normal).
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -39,6 +54,8 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Message helpers. error() prints and EXITS, so it is only used to stop the
+# run before (or instead of) making a change.
 info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
 success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
@@ -72,6 +89,8 @@ start_logging() {
   mkdir -p "$LOG_DIR"
   DEPLOY_LOG="$LOG_DIR/ct-${CT_ID}-$(date +%Y%m%d-%H%M%S).log"
   ( umask 077; : > "$DEPLOY_LOG" )
+  # From here on, all output (stdout + stderr) goes to the screen AND the log;
+  # on_exit runs whenever the script ends, on success or failure.
   exec > >(tee -a "$DEPLOY_LOG") 2>&1
   trap on_exit EXIT
   info "Logging this install to $DEPLOY_LOG"
@@ -144,6 +163,7 @@ get_config() {
   read -rp "Container ID [$next_id]: " CT_ID
   CT_ID="${CT_ID:-$next_id}"
   [[ "$CT_ID" =~ ^[0-9]+$ ]] || error "Container ID must be a number."
+  # Refuse an ID that is already taken (pct create would fail later anyway).
   pct status "$CT_ID" &>/dev/null && error "Container ID $CT_ID already exists."
 
   read -rp "Hostname [claude-code]: " CT_HOSTNAME
@@ -151,6 +171,8 @@ get_config() {
 
   read_password CT_PASSWORD "Root password"
 
+  # Resources. The defaults (4 cores, 10 GB RAM, 2 GB swap, 30 GB disk) leave
+  # room for Docker builds, Playwright and a few Claude sessions at once.
   read -rp "CPU cores [4]: " CT_CORES
   CT_CORES="${CT_CORES:-4}"
 
@@ -163,6 +185,7 @@ get_config() {
   read -rp "Disk size in GB [30]: " CT_DISK
   CT_DISK="${CT_DISK:-30}"
 
+  # A Proxmox storage ID that can hold container disks (Datacenter → Storage).
   read -rp "Storage [local-lvm]: " CT_STORAGE
   CT_STORAGE="${CT_STORAGE:-local-lvm}"
 
@@ -260,6 +283,8 @@ get_config() {
   [[ "$CT_USER_SUDO" =~ ^[Nn] ]] && CT_USER_SUDO="no" || CT_USER_SUDO="yes"
 
   echo ""
+  # Everything chosen above, for a last look: nothing on the system has changed
+  # yet, and answering anything but y at "Proceed?" leaves it that way.
   echo -e "${BOLD}Summary${NC}"
   echo "─────────────────────────────────────────────────"
   echo "  CT ID:     $CT_ID"
@@ -308,6 +333,7 @@ create_container() {
   # Build pct create command. nesting=1 lets Docker (and systemd services) run
   # inside the container; keyctl=1 is needed by Docker in unprivileged mode.
   # --start 0: we add the AppArmor line below before the first boot.
+  # shellcheck disable=SC2054  # the commas in --features are pct syntax, not array separators
   local cmd=(
     pct create "$CT_ID" "$TEMPLATE_PATH"
     --hostname "$CT_HOSTNAME"
@@ -411,6 +437,7 @@ apt_lock_holders() {  # PIDs holding an apt/dpkg lock file, one per line
     lslocks -n -r -o PID,PATH 2>/dev/null | awk -v l=" $APT_LOCKS " 'index(l, " " $2 " ") { print $1 }' | sort -u
   fi
 }
+# Poll every 5 s; print who holds the lock every 30 s; stop waiting at 180 s.
 APT_WAITED=0
 while APT_HOLDERS="$(apt_lock_holders)" && [ -n "$APT_HOLDERS" ]; do
   if [ "$APT_WAITED" -ge 180 ]; then
@@ -457,6 +484,10 @@ fi
 echo ">>> Updating system..."
 apt-get upgrade -y -qq
 
+# Base tools: git + downloaders, apt/HTTPS plumbing, shells/editors/terminal
+# multiplexers (tmux also gives agent teams split panes), JSON/YAML tools,
+# network diagnostics, the SSH server, sudo, and cron/logrotate for the
+# weekly agentic-update.
 echo ">>> Installing core packages..."
 apt-get install -y -qq \
   git curl wget unzip zip \
@@ -468,6 +499,8 @@ apt-get install -y -qq \
   openssh-server sudo \
   cron logrotate
 
+# Compilers plus the -dev headers pip/npm/cargo need to build native
+# extensions (OpenSSL, libffi, SQLite, zlib, readline, bz2, ncurses, xz, XML).
 echo ">>> Installing build tools & dev libraries..."
 apt-get install -y -qq \
   build-essential make cmake pkg-config autoconf automake libtool \
@@ -475,12 +508,16 @@ apt-get install -y -qq \
   libssl-dev libffi-dev libsqlite3-dev zlib1g-dev \
   libreadline-dev libbz2-dev libncurses-dev liblzma-dev libxml2-dev libxslt-dev
 
+# What Claude Code and you search with. Debian/Ubuntu rename two of them:
+# fd is `fdfind` and bat is `batcat`.
 echo ">>> Installing search & productivity tools..."
 apt-get install -y -qq \
   ripgrep fd-find fzf bat \
   rsync \
   sqlite3
 
+# Clients only (psql, redis-cli; sqlite3 above): no database server is
+# installed by this script.
 echo ">>> Installing database clients..."
 apt-get install -y -qq \
   postgresql-client redis-tools
@@ -518,6 +555,9 @@ done
 # user:password lines from the host; deleted the moment they're applied.
 chpasswd < /root/agentic-provision.chpasswd
 rm -f /root/agentic-provision.chpasswd
+# Optional SSH public key from the prompt (root already got it from pct
+# create): appended to the user's authorized_keys, with the permissions sshd
+# insists on (700 / 600).
 if [ -s /root/agentic-provision.pub ]; then
   for u in $AGENTIC_USERS; do
     h="$(getent passwd "$u" | cut -d: -f6)"
@@ -565,10 +605,14 @@ echo ">>> Setting up the shared toolchain environment..."
 # agentic-update); the user's shells and the CloudCLI service point at them. /etc/environment covers PAM logins (SSH,
 # su, sudo -i); /etc/profile.d covers login shells; the bashrc block below covers
 # `pct enter`.
+# For the rest of THIS script: rustup installs into /opt/rust, and its
+# cargo/rustc proxies are on PATH for the language-server step below.
 export RUSTUP_HOME=/opt/rust/rustup
 export CARGO_HOME=/opt/rust/cargo
 export PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 export PATH="/opt/rust/cargo/bin:$PATH"
+# Login shells get the shared toolchain locations. CARGO_HOME is deliberately
+# NOT set for users (see the Rust step): their crates go to ~/.cargo.
 cat > /etc/profile.d/agentic.sh << 'PROFILE'
 export RUSTUP_HOME=/opt/rust/rustup
 export PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
@@ -741,6 +785,8 @@ echo ">>> Installing language servers (backends for the *-lsp plugins)..."
 # PATH — they do NOT self-install the binary. Toolchains (Node/Go/Rust) are
 # already installed above, so this just adds the servers, system-wide so every
 # user's plugins find them. All non-fatal.
+# Each line: skip when the server is already on PATH, else install it, else
+# only warn (a missing language server just disables that one plugin).
 command -v typescript-language-server >/dev/null 2>&1 \
   || npm install -g "${NPM_QUIET[@]}" typescript-language-server typescript \
   || echo "    [WARN] typescript-language-server install failed"
@@ -789,6 +835,7 @@ echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
 # block is non-fatal: a browser-install failure must NEVER abort provisioning
 # (it previously killed everything after it — Docker services, SSH, cron —
 # because the script runs under `set -e`).
+# set +e: until the matching set -e below, a failing command doesn't stop the run.
 set +e
 unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
 pip install --break-system-packages --root-user-action=ignore -q playwright \
@@ -992,6 +1039,8 @@ SHARE=/usr/local/share/agentic
 CONF=/etc/agentic/users.conf
 AGENTIC_USERS="" AGENTIC_PRIMARY="" AGENTIC_SUDO="yes"
 [ -f "$CONF" ] && source "$CONF"
+# The user to set up: the first argument, or the one recorded in users.conf.
+# Must be a valid normal user name; root is refused.
 u="${1:-$AGENTIC_PRIMARY}"
 if ! [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || [ "$u" = root ]; then
   echo "usage: agentic-setup-user [username]   (a normal user, not root)" >&2
@@ -1007,6 +1056,7 @@ if ! id "$u" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$u"
   echo ">>> [$u] created user (set a password with: sudo passwd $u)"
 fi
+# docker group = docker without sudo (root-equivalent inside this container).
 if getent group docker >/dev/null; then usermod -aG docker "$u"; fi
 if [ "$AGENTIC_SUDO" = yes ]; then usermod -aG sudo "$u"; fi
 h="$(getent passwd "$u" | cut -d: -f6)"
@@ -1035,6 +1085,9 @@ CLAUDE_BIN="$h/.local/bin/claude"
 [ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$h/.claude/bin/claude"
 echo "    Claude Code installed: $(as_user "$CLAUDE_BIN" --version 2>/dev/null || echo 'version unknown')"
 
+# ~/.claude is private (it holds the login). The shared settings template is
+# copied only when the user has no settings.json yet, so yours is never
+# overwritten by a re-run.
 install -d -m 700 -o "$u" -g "$u" "$h/.claude"
 install -d -o "$u" -g "$u" "$h/.claude/skills"
 if [ ! -e "$h/.claude/settings.json" ]; then
@@ -1105,6 +1158,8 @@ as_user "$CLAUDE_BIN" plugin list 2>/dev/null || echo "    (plugin list unavaila
 # once inside an interactive session as that user.
 # ---------------------------------------------------------------------------
 
+# The webapp-testing skill (copied once), the shell block (appended once; its
+# header line is the marker that prevents duplicates) and git defaults.
 echo ">>> [$u] Skills, shell and git defaults..."
 if [ -d "$SHARE/skills/webapp-testing" ] && [ ! -e "$h/.claude/skills/webapp-testing" ]; then
   cp -r "$SHARE/skills/webapp-testing" "$h/.claude/skills/webapp-testing"
@@ -1148,6 +1203,8 @@ fi
 exec "\$HOME/.local/bin/claude" "\$@"
 CLAUDEWRAP
 chmod 755 /usr/local/bin/claude
+# Paths later steps need: the user's home and their claude binary (the native
+# installer uses ~/.local/bin; older installs used ~/.claude/bin).
 PRIMARY_HOME="$(getent passwd "$AGENTIC_PRIMARY" | cut -d: -f6)"
 PRIMARY_CLAUDE="$PRIMARY_HOME/.local/bin/claude"
 [ -x "$PRIMARY_CLAUDE" ] || PRIMARY_CLAUDE="$PRIMARY_HOME/.claude/bin/claude"
@@ -1219,6 +1276,8 @@ Environment=NODE_ENV=production
 # succeed.
 Environment=NPM_CONFIG_INCLUDE=dev
 Environment=HOME=${PRIMARY_HOME}
+# Listen on every interface (LAN access) on :3001; drive this user's claude
+# and keep the web UI's own login database in their home.
 Environment=HOST=0.0.0.0
 Environment=SERVER_PORT=3001
 Environment=CLAUDE_CLI_PATH=${PRIMARY_CLAUDE}
@@ -1235,6 +1294,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+# Load the new unit, start it at every boot, and start it now.
 systemctl daemon-reload
 systemctl enable cloudcli >/dev/null 2>&1 || true
 systemctl start cloudcli \
@@ -1409,6 +1469,9 @@ REPORT="$(mktemp)"; trap 'rm -f "$REPORT"' EXIT
 {
 echo "$LOG_TAG $(date '+%Y-%m-%d %H:%M:%S %Z')"
 [ -n "$AGENTIC_USERS" ] || { echo "  FAIL no Claude users in /etc/agentic/users.conf"; rc=1; }
+# Per-user checks: claude exists and starts (run as the user with a clean
+# environment), settings.json parses, and, informational only, whether
+# they have logged in yet.
 for u in $AGENTIC_USERS; do
   h="$(getent passwd "$u" | cut -d: -f6)"
   if [ -z "$h" ]; then echo "  FAIL $u: user does not exist"; rc=1; continue; fi
@@ -1419,6 +1482,7 @@ for u in $AGENTIC_USERS; do
   check "$u: in docker group"             "id -nG '$u' | grep -qw docker"
   note  "$u: claude logged in (creds on disk; run 'claude' /login as $u if WARN)" "test -s '$h/.claude/.credentials.json'"
 done
+# Shared toolchains and services.
 check "shared Rust toolchain"       "RUSTUP_HOME=/opt/rust/rustup /opt/rust/cargo/bin/rustc --version"
 check "GitHub CLI (gh) present"     "command -v gh"
 check "cloudcli service active"     "systemctl is-active --quiet cloudcli"
@@ -1489,6 +1553,8 @@ for u in $AGENTIC_USERS; do
 done
 
 echo ">>> [3/7] Rust (shared toolchain in /opt/rust)..."
+# CARGO_HOME is set for this one call so rustup updates the shared proxies in
+# /opt/rust/cargo; users keep their own ~/.cargo.
 if [ -x /opt/rust/cargo/bin/rustup ]; then
   RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo /opt/rust/cargo/bin/rustup update \
     || echo "    [WARN] rustup update failed"
@@ -1524,6 +1590,9 @@ fi
 systemctl restart cloudcli || echo "    [WARN] cloudcli restart failed"
 
 echo ">>> [6/7] Docker images (one-shot Watchtower)..."
+# Watchtower, run once and then removed (--rm): pulls newer images for the
+# running containers, recreates them with the same settings, and deletes the
+# old images (--cleanup).
 if command -v docker >/dev/null 2>&1 && [ -n "$(docker ps -q 2>/dev/null)" ]; then
   docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
     containrrr/watchtower --run-once --cleanup \
@@ -1540,6 +1609,8 @@ else
 fi
 # Copy this run's [WARN]/FAIL lines, each tagged with its step, to the user's
 # Agentic-Errors.txt (agentic-errorlog). A clean run writes nothing.
+# awk keeps the current ">>> [n/N]" step header in mind and prints every
+# [WARN] / WARN / FAIL line prefixed with that step.
 PROBLEMS="$(tail -c +"$((LOG_START + 1))" "$LOG" | awk '
   /^>>> \[[0-9]+\/[0-9]+\]/ { step = $2; next }
   /\[WARN\]|^  (WARN|FAIL) / { sub(/^ +/, ""); print (step ? step " " : "") $0 }')"
@@ -1550,6 +1621,8 @@ echo ""
 UPDATE
 chmod +x /usr/local/bin/agentic-update
 
+# cron.d format: minute hour day-of-month month day-of-week USER command.
+# "0 4 * * 0" = 04:00 every Sunday, run as root.
 cat > /etc/cron.d/agentic-update << 'CRON'
 # Weekly coordinated update - Sunday 4:00 AM ET
 # (OS + Rust + Claude Code + CloudCLI UI + container images,
@@ -1560,6 +1633,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 CRON
 chmod 0644 /etc/cron.d/agentic-update
 
+# Keep the update log small: rotated monthly, the last 3 kept compressed.
 cat > /etc/logrotate.d/agentic-update << 'LOGROTATE'
 /var/log/agentic-update.log {
     monthly
@@ -1570,6 +1644,7 @@ cat > /etc/logrotate.d/agentic-update << 'LOGROTATE'
 }
 LOGROTATE
 
+# Remove packages nothing depends on any more, and apt's downloaded .deb cache.
 echo ">>> Cleaning up..."
 apt-get autoremove -y -qq
 apt-get clean -qq
@@ -1601,6 +1676,8 @@ PROVISION_EOF
       printf '%s:%s\n' "$u" "${CT_USER_PASSWORDS[$u]}"
     done > /tmp/provision-${CT_ID}.chpasswd
   )
+  # Copy the env and password files into the container (still 0600), then
+  # delete the host copies straight away.
   pct push "$CT_ID" /tmp/provision-${CT_ID}.env /root/agentic-provision.env --perms 0600
   pct push "$CT_ID" /tmp/provision-${CT_ID}.chpasswd /root/agentic-provision.chpasswd --perms 0600
   rm -f /tmp/provision-${CT_ID}.env /tmp/provision-${CT_ID}.chpasswd
@@ -1608,6 +1685,8 @@ PROVISION_EOF
     pct push "$CT_ID" "$CT_SSH_KEY" /root/agentic-provision.pub --perms 0600
   fi
 
+  # Push the provision script in and run it inside the container. Its output
+  # streams back here, so it lands in the host log too.
   chmod +x /tmp/provision-${CT_ID}.sh
   pct push "$CT_ID" /tmp/provision-${CT_ID}.sh /tmp/provision.sh
   pct exec "$CT_ID" -- chmod +x /tmp/provision.sh
@@ -1652,10 +1731,12 @@ Log in as __USER__, then run `claude` (the shell auto-cd's to `/project`).
 _IP above is the address at deploy time; on DHCP it may change (check with `pct exec __CTID__ -- hostname -I`)._
 EOF
 )
+  # Fill in the placeholders.
   notes=${notes//__IP__/$ct_ip}
   notes=${notes//__CTID__/$CT_ID}
   notes=${notes//__USER__/$CT_PRIMARY_USER}
 
+  # The Notes panel shows the container's description field.
   if pct set "$CT_ID" --description "$notes" >/dev/null 2>&1; then
     success "Wrote container notes to the Proxmox UI."
   else

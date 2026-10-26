@@ -1,6 +1,6 @@
 # Claude Code LXC: Use and Best Practices
 
-Oct 25, 2026 · Joe Solch
+Oct 26, 2026 · Joe Solch
 
 ## What you get
 
@@ -144,7 +144,7 @@ Further hardening you can add:
 
 ## Troubleshooting
 
-Start with `~/Agentic-Errors.txt` if it exists, then `sudo agentic-doctor`; each FAIL line names the part to look at.
+Start with `~/Agentic-Errors.txt` if it exists, then `sudo agentic-doctor`; each FAIL line names the part to look at. The comment block at the top of the deploy script has a "Where things live" list of every file it writes, and comments through the script explain each step.
 
 | Symptom | Check or fix |
 | --- | --- |
