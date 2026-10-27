@@ -137,7 +137,7 @@ There's no container around Claude here, so the user account is the boundary. Cl
 | Claude permissions | Auto mode, plus deny rules for secrets and credential files (~/.ssh, gh, git, npm), `dd`, `mkfs`, `rm -rf /`, `sudo` and `su` | Claude can't read credentials or escalate on its own |
 | npm install scripts | Allowed only for the web UI's four native modules; the weekly tool updates run with none | A compromised package can't run code as root when it's installed |
 | Cowork | Runs tasks in its own QEMU/KVM VM; the user is in the `kvm` group | The VM is the app's sandbox; `kvm` grants VM access, not root |
-| SSH | Root and the user log in with a password or key; at most 4 tries per connection | Convenient; keep port 22 on your LAN |
+| SSH | The user logs in with a password or key. Root is key only unless you choose "password" at deploy, which the script warns against (each re-run asks again); at most 4 tries per connection | A guessable root password over the network would be the whole machine; keep port 22 on your LAN |
 | Web UI | Runs as the user; own login; listens on the machine only unless you chose LAN at deploy, and starts only after setup is finished | Plain HTTP on port 3001: use an SSH tunnel, or keep LAN access to a trusted network or behind a TLS reverse proxy |
 | Phone alerts | Off unless you set an ntfy topic; settings file is root-only | A guessable topic would let others read your alerts |
 | Updates | Weekly, with health check | Keeps OS, Claude Desktop and Claude Code patched |
@@ -146,7 +146,7 @@ Further hardening you can add:
 
 - Turn on the firewall (`sudo ufw allow from <your-lan> to any port 22 proto tcp`, plus port 3001 if you chose LAN access for the web UI, then `sudo ufw enable`), or the Proxmox firewall for a VM.
 - Use SSH keys, and set PasswordAuthentication no in /etc/ssh/sshd_config.d/00-agentic.conf once they work.
-- If you never need root over SSH, set PermitRootLogin no in that same file.
+- If you never need root over SSH, set PermitRootLogin no in that same file. (Re-running the script resets it to your key-only or password choice.)
 
 ## Troubleshooting
 

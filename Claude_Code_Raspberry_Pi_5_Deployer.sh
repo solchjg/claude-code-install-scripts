@@ -28,7 +28,8 @@
 # How it runs (see main() at the bottom):
 #   1. Interactive: check the Pi/OS, then ask for the hostname, timezone, the
 #      root password and the ONE Claude user (an existing account such as the
-#      one Raspberry Pi Imager created, or a new one), optional ntfy alerts,
+#      one Raspberry Pi Imager created, or a new one), an optional SSH key,
+#      root SSH (key only by default, or password), optional ntfy alerts,
 #      the memory profile (4gb lean / 8gb standard, suggested from the RAM),
 #      the CloudCLI web UI y/n (off by default on 4gb; "no" on a re-run
 #      removes an installed one), Claude Desktop y/n (Chat + Code; Cowork is
@@ -238,6 +239,36 @@ preflight() {
 # Asks everything up front (nothing is changed until "Proceed? y"), so the rest
 # of the run is unattended. Sets the PI_* / CT_* globals used by every later
 # step (CT_* names kept from the Proxmox deployer so the shared parts line up).
+# Ask how root may log in over SSH. "key" (the default) is PermitRootLogin
+# prohibit-password: root needs an SSH key, and its password is never accepted
+# over the network (the console and `su -` still take it). "password" keeps
+# root's password usable over SSH, which lets anyone who can reach port 22
+# try to guess it. Asked on every run, so a re-run can switch either way; the
+# previous answer is the default.
+ask_root_ssh() {
+  local ans def=key has_key=no
+  if grep -qs '^# root SSH: password' /etc/ssh/sshd_config.d/00-agentic.conf; then def=password; fi
+  if [[ -n "${CT_SSH_KEY:-}" ]] || [[ -s /root/.ssh/authorized_keys ]]; then has_key=yes; fi
+  while true; do
+    read -rp "Root SSH login: key only, or password allowed too? [key/password, default $def]: " ans
+    case "${ans:-$def}" in
+      k|key) CT_ROOT_SSH=key ;;
+      p|password) CT_ROOT_SSH=password ;;
+      *) warn "Please answer key or password."; continue ;;
+    esac
+    break
+  done
+  if [[ "$CT_ROOT_SSH" == password ]]; then
+    warn "Root's password will work over SSH. Anyone who can reach port 22 can try to guess it,"
+    warn "and a guessed root password is the whole machine. Use a long, unique password, keep"
+    warn "port 22 off the internet, and re-run this script and choose key once a key works."
+  elif [[ "$has_key" == no ]]; then
+    warn "No SSH key is set up for root, so root can't log in over SSH at all. The console"
+    warn "and su - from the Claude user still work. To allow root over SSH, add a key to"
+    warn "/root/.ssh/authorized_keys (or give one at the key prompt when you re-run this script)."
+  fi
+}
+
 # Ask where the web UI (port 3001) should listen. Local is the default: the UI
 # is a full shell as the Claude user, so only open it to the LAN on purpose.
 # Asked on every run, so a re-run can switch it either way.
@@ -295,6 +326,7 @@ get_config() {
       error "$CT_SSH_KEY isn't a single SSH public key line (like the contents of ~/.ssh/id_ed25519.pub)."
     fi
   fi
+  ask_root_ssh
 
   # ntfy push alerts (optional). When agentic-update or agentic-doctor hits a
   # WARN/FAIL, agentic-errorlog writes Agentic-Errors.txt as always and, if a
@@ -532,7 +564,7 @@ get_config() {
   echo "  Timezone:  $CT_TZ"
   echo "  User:      $CT_USER ($([[ $CT_USER_EXISTS == yes ]] && echo existing || echo new); sudo: $CT_USER_SUDO$([[ $CT_FIX_NOPASSWD == yes ]] && echo ', password now required'))"
   echo "  Password:  $([[ -n "${CT_USER_PASSWORDS[$CT_USER]:-}" ]] && echo "new for $CT_USER" || echo "$CT_USER keeps theirs"); root password set"
-  echo "  SSH:       root + $CT_USER, password$([[ -n "$CT_SSH_KEY" ]] && echo " or key")"
+  echo "  SSH:       $CT_USER by password$([[ -n "$CT_SSH_KEY" ]] && echo " or key"); root by $([[ $CT_ROOT_SSH == key ]] && echo 'key only' || echo 'password or key (WARNING: guessable over the network)')"
   echo "  Alerts:    Agentic-Errors.txt$([[ -n "$CT_NTFY_TOPIC" ]] && echo " + ntfy push to $CT_NTFY_TOPIC$([[ -n "$CT_NTFY_TOKEN" ]] && echo ' (with token)')")"
   echo "  Desktop:   Claude Desktop $([[ $CT_DESKTOP == yes ]] && echo 'yes (Chat + Code; Cowork left out)' || echo no)"
   echo "  Kernel:    ${PI_PAGESIZE}-byte pages$([[ $CT_4K == yes ]] && echo ' → 4K after reboot')"
@@ -1573,9 +1605,11 @@ echo ">>> Configuring SSH..."
 # with PasswordAuthentication no) silently outranks any edit to the main file.
 # Own a drop-in that sorts first instead, and keep the main-file edit for images
 # that predate the Include.
-# Root and the user may both log in with a password (or a key). MaxAuthTries
-# caps guesses per connection.
-sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
+# The user logs in with a password or a key. Root: key only (prohibit-password)
+# unless "password" was chosen at the prompt. MaxAuthTries caps guesses per
+# connection.
+if [ "${AGENTIC_ROOT_SSH:-key}" = password ]; then ROOT_LOGIN=yes; else ROOT_LOGIN=prohibit-password; fi
+sed -i "s/^#*PermitRootLogin.*/PermitRootLogin $ROOT_LOGIN/" /etc/ssh/sshd_config
 sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
 # Claude Desktop's SSH sessions copy files over SFTP; Ubuntu ships the line, but
 # make sure it's there.
@@ -1583,10 +1617,11 @@ grep -qE '^[[:space:]]*Subsystem[[:space:]]+sftp' /etc/ssh/sshd_config \
   || echo 'Subsystem sftp /usr/lib/openssh/sftp-server' >> /etc/ssh/sshd_config
 if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
   mkdir -p /etc/ssh/sshd_config.d
-  cat > /etc/ssh/sshd_config.d/00-agentic.conf <<'SSHD'
+  cat > /etc/ssh/sshd_config.d/00-agentic.conf <<SSHD
 # Managed by the Claude Code Pi deployer. Sorts before any other drop-in, and sshd keeps the first
 # value it sees, so these win over cloud-init's defaults.
-PermitRootLogin yes
+# root SSH: ${AGENTIC_ROOT_SSH:-key} (chosen at deploy; re-run the deployer to change it)
+PermitRootLogin $ROOT_LOGIN
 PasswordAuthentication yes
 MaxAuthTries 4
 SSHD
@@ -2512,6 +2547,7 @@ PROVISION_EOF
       printf 'AGENTIC_NTFY_SERVER=%q\n' "$CT_NTFY_SERVER"
       printf 'AGENTIC_NTFY_TOKEN=%q\n' "$CT_NTFY_TOKEN"
       printf 'AGENTIC_WEBUI_BIND=%q\n' "$CT_WEBUI_BIND"
+      printf 'AGENTIC_ROOT_SSH=%q\n' "$CT_ROOT_SSH"
       printf 'AGENTIC_TZ=%q\n' "$CT_TZ"
       printf 'AGENTIC_DESKTOP=%q\n' "$CT_DESKTOP"
       printf 'AGENTIC_4K=%q\n' "$CT_4K"
@@ -2663,7 +2699,7 @@ print_summary() {
   [[ "$CT_WEBUI_REMOVE" == yes ]] && echo -e "  ${BOLD}Web UI:${NC}    CloudCLI removed (login data kept in ~$CT_USER/.cloudcli)"
   echo -e "  ${BOLD}Timezone:${NC}  $CT_TZ"
   echo -e "  ${BOLD}User:${NC}      $CT_USER (Claude runs only as this user; sudo: $CT_USER_SUDO)"
-  echo -e "  ${BOLD}Security:${NC}  SSH for root + $CT_USER (password$([[ -n "$CT_SSH_KEY" ]] && echo ' or key'))$([[ $CT_FIX_NOPASSWD == yes ]] && echo '; sudo now asks for a password')"
+  echo -e "  ${BOLD}Security:${NC}  SSH for $CT_USER (password$([[ -n "$CT_SSH_KEY" ]] && echo ' or key')) and root ($([[ $CT_ROOT_SSH == key ]] && echo 'key only' || echo 'password or key'))$([[ $CT_FIX_NOPASSWD == yes ]] && echo '; sudo now asks for a password')"
   echo ""
   echo -e "  ${BOLD}Connect:${NC}"
   [[ -n "${ip:-}" ]] && echo -e "    SSH:     ${CYAN}ssh ${CT_USER}@${ip}${NC}  (or ${CYAN}ssh ${CT_USER}@${CT_HOSTNAME}.local${NC})"

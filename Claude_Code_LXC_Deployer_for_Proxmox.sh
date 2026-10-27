@@ -157,6 +157,37 @@ resolve_template() {
 # ── Configuration ───────────────────────────────────────────────────────────
 # Asks everything up front (nothing is created until "Proceed? y"), so the rest
 # of the run is unattended. Sets the CT_* globals used by every later step.
+# Ask how root may log in over SSH. "key" (the default) is PermitRootLogin
+# prohibit-password: root needs an SSH key, and its password is never accepted
+# over the network (the console and `su -` still take it). "password" keeps
+# root's password usable over SSH, which lets anyone who can reach port 22
+# try to guess it.
+ask_root_ssh() {
+  local ans def=key has_key=no
+  # (A new container every run, so there's no previous answer; the host's own
+  # /root/.ssh doesn't count, only the key given above.)
+  if [[ -n "${CT_SSH_KEY:-}" ]]; then has_key=yes; fi
+  while true; do
+    read -rp "Root SSH login: key only, or password allowed too? [key/password, default $def]: " ans
+    case "${ans:-$def}" in
+      k|key) CT_ROOT_SSH=key ;;
+      p|password) CT_ROOT_SSH=password ;;
+      *) warn "Please answer key or password."; continue ;;
+    esac
+    break
+  done
+  if [[ "$CT_ROOT_SSH" == password ]]; then
+    warn "Root's password will work over SSH. Anyone who can reach port 22 can try to guess it,"
+    warn "and a guessed root password is the whole container. Use a long, unique password, keep"
+    warn "port 22 off the internet, and once a key works set 'PermitRootLogin prohibit-password'"
+    warn "in /etc/ssh/sshd_config.d/00-agentic.conf inside the container."
+  elif [[ "$has_key" == no ]]; then
+    warn "No SSH key was given, so root can't log in over SSH at all. Use 'pct enter <id>',"
+    warn "or log in as the Claude user and run su -. To add a key later, put it in"
+    warn "/root/.ssh/authorized_keys inside the container."
+  fi
+}
+
 # Ask where the web UI (port 3001) should listen. Local is the default: the UI
 # is a full shell as the Claude user, so only open it to the LAN on purpose.
 # Asked on every run, so a re-run can switch it either way.
@@ -242,6 +273,7 @@ get_config() {
       error "$CT_SSH_KEY isn't a single SSH public key line (like the contents of ~/.ssh/id_ed25519.pub)."
     fi
   fi
+  ask_root_ssh
 
   # ntfy push alerts (optional). When agentic-update or agentic-doctor hits a
   # WARN/FAIL, agentic-errorlog writes Agentic-Errors.txt as always and, if a
@@ -345,7 +377,7 @@ get_config() {
   echo "  DNS:       $CT_DNS"
   echo "  Type:      $([[ $CT_UNPRIV -eq 1 ]] && echo unprivileged || echo 'PRIVILEGED (container root = host root)')"
   echo "  User:      $CT_USER (sudo: $CT_USER_SUDO)"
-  echo "  SSH:       root + $CT_USER, password$([[ -n "$CT_SSH_KEY" ]] && echo " or key")"
+  echo "  SSH:       $CT_USER by password$([[ -n "$CT_SSH_KEY" ]] && echo " or key"); root by $([[ $CT_ROOT_SSH == key ]] && echo 'key only' || echo 'password or key (WARNING: guessable over the network)')"
   echo "  Web UI:    port 3001, $([[ $CT_WEBUI_BIND == 0.0.0.0 ]] && echo 'open to the LAN' || echo 'local only (reach it through an SSH tunnel)')"
   echo "  Alerts:    Agentic-Errors.txt$([[ -n "$CT_NTFY_TOPIC" ]] && echo " + ntfy push to $CT_NTFY_TOPIC$([[ -n "$CT_NTFY_TOKEN" ]] && echo ' (with token)')")"
   echo "─────────────────────────────────────────────────"
@@ -1047,9 +1079,11 @@ echo ">>> Configuring SSH..."
 # with PasswordAuthentication no) silently outranks any edit to the main file.
 # Own a drop-in that sorts first instead, and keep the main-file edit for images
 # that predate the Include.
-# Root and the user may both log in with a password (or a key). MaxAuthTries
-# caps guesses per connection.
-sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
+# The user logs in with a password or a key. Root: key only (prohibit-password)
+# unless "password" was chosen at the prompt. MaxAuthTries caps guesses per
+# connection.
+if [ "${AGENTIC_ROOT_SSH:-key}" = password ]; then ROOT_LOGIN=yes; else ROOT_LOGIN=prohibit-password; fi
+sed -i "s/^#*PermitRootLogin.*/PermitRootLogin $ROOT_LOGIN/" /etc/ssh/sshd_config
 sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
 # Claude Desktop's SSH sessions copy files over SFTP; Ubuntu ships the line, but
 # make sure it's there.
@@ -1057,10 +1091,11 @@ grep -qE '^[[:space:]]*Subsystem[[:space:]]+sftp' /etc/ssh/sshd_config \
   || echo 'Subsystem sftp /usr/lib/openssh/sftp-server' >> /etc/ssh/sshd_config
 if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
   mkdir -p /etc/ssh/sshd_config.d
-  cat > /etc/ssh/sshd_config.d/00-agentic.conf <<'SSHD'
+  cat > /etc/ssh/sshd_config.d/00-agentic.conf <<SSHD
 # Managed by agentic.sh. Sorts before any other drop-in, and sshd keeps the first
 # value it sees, so these win over cloud-init's defaults.
-PermitRootLogin yes
+# root SSH: ${AGENTIC_ROOT_SSH:-key} (chosen at deploy)
+PermitRootLogin $ROOT_LOGIN
 PasswordAuthentication yes
 MaxAuthTries 4
 SSHD
@@ -1833,6 +1868,7 @@ PROVISION_EOF
       printf 'AGENTIC_NTFY_SERVER=%q\n' "$CT_NTFY_SERVER"
       printf 'AGENTIC_NTFY_TOKEN=%q\n' "$CT_NTFY_TOKEN"
       printf 'AGENTIC_WEBUI_BIND=%q\n' "$CT_WEBUI_BIND"
+      printf 'AGENTIC_ROOT_SSH=%q\n' "$CT_ROOT_SSH"
     } > /tmp/provision-${CT_ID}.env
     for u in "${CT_USERS[@]}"; do
       printf '%s:%s\n' "$u" "${CT_USER_PASSWORDS[$u]}"
@@ -1930,7 +1966,7 @@ print_summary() {
   echo -e "  ${BOLD}Storage:${NC}   $CT_STORAGE"
   echo -e "  ${BOLD}Timezone:${NC}  America/New_York"
   echo -e "  ${BOLD}User:${NC}      $CT_USER (Claude runs only as this user; sudo: $CT_USER_SUDO)"
-  echo -e "  ${BOLD}Security:${NC}  $([[ $CT_UNPRIV -eq 1 ]] && echo 'unprivileged container' || echo 'PRIVILEGED container'); SSH for root + $CT_USER (password$([[ -n "$CT_SSH_KEY" ]] && echo ' or key'))"
+  echo -e "  ${BOLD}Security:${NC}  $([[ $CT_UNPRIV -eq 1 ]] && echo 'unprivileged container' || echo 'PRIVILEGED container'); SSH for $CT_USER (password$([[ -n "$CT_SSH_KEY" ]] && echo ' or key')) and root ($([[ $CT_ROOT_SSH == key ]] && echo 'key only' || echo 'password or key'))"
   echo ""
   echo -e "  ${BOLD}Connect:${NC}"
   echo -e "    Console: ${CYAN}pct enter $CT_ID${NC}"

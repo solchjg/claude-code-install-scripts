@@ -25,7 +25,7 @@ One Ubuntu 26.04 container per person, with Claude Code running as one normal us
 Do these right after the script finishes, in this order; step 1 matters most.
 
 1. **Claim the web UI.** It listens only on the container unless you chose LAN at deploy. From your PC, run `ssh -L 3001:localhost:3001 <user>@<ip>` and open `http://localhost:3001` (with LAN access, open `http://<ip>:3001` instead). Create its login straight away: until you do, anyone who can reach it can create it.
-2. **Log in as your user.** Use `ssh <user>@<ip>` with the user's own password, which the script requires to be different from root's. From the Proxmox host you can also run `pct enter <id>`, then `su - <user>`. Root can log in over SSH with its password too, but don't run Claude as root.
+2. **Log in as your user.** Use `ssh <user>@<ip>` with the user's own password, which the script requires to be different from root's. From the Proxmox host you can also run `pct enter <id>`, then `su - <user>`. Root logs in over SSH with a key only, unless you chose "password" at deploy; either way, don't run Claude as root.
 3. **Sign in to Claude.** Run `claude` and follow `/login`. A claude.ai subscription also enables Remote Control.
 4. **Check health.** Run `sudo agentic-doctor`. Every line should say OK. The only expected WARN is "logged in", and only before step 3. Any WARN or FAIL is also copied to ~/Agentic-Errors.txt, so if you ran it before step 3, delete that file.
 5. **Set your git identity.** Run `git config --global user.name "..."` and `git config --global user.email "..."`.
@@ -51,7 +51,7 @@ Log in as your user, `cd` into a project under /project, and run `claude` there.
 You don't need a desktop VM. Claude Desktop on your own computer (Mac, Windows, or the Linux beta for Ubuntu and Debian) can open an SSH session to this container. It then works on the container's /project with your ~/.claude settings and skills.
 
 1. **Make a key on your PC** if you don't have one: `ssh-keygen -t ed25519`.
-2. **Copy it to the container:** `ssh-copy-id <user>@<ip>`. You can also give the key's path when you run the deploy script, which installs it for root and your user.
+2. **Copy it to the container:** `ssh-copy-id <user>@<ip>`. You can also give the key's path when you run the deploy script, which installs it for root and your user. Root can only SSH in with a key unless you choose "password" at deploy.
 3. **Load it in your SSH agent** (`ssh-add`). Desktop can't type passwords or passphrases.
 4. **Add the connection:** in Desktop's Code tab, add an SSH connection to `<user>@<ip>`, leaving the key field empty to use your SSH config and agent.
 5. **Pick the folder** `/project/src/<app>` and start a session.
@@ -128,7 +128,7 @@ The container is the security boundary. Inside it, Claude runs as a normal user 
 | Claude user | Normal account; root is blocked from running `claude` | Limits what an agent mistake touches |
 | Claude permissions | Auto mode, plus deny rules for secrets and credential files (~/.ssh, gh, git, npm), `dd`, `mkfs`, `rm -rf /`, `sudo` and `su` | Claude can't read credentials or escalate on its own |
 | npm install scripts | Allowed only for the web UI's four native modules; the weekly tool updates run with none | A compromised package can't run code as root when it's installed |
-| SSH | Root and the user log in with a password or key; at most 4 tries per connection | Convenient; keep port 22 on your LAN |
+| SSH | The user logs in with a password or key. Root is key only unless you choose "password" at deploy, which the script warns against; at most 4 tries per connection | A guessable root password over the network would be the whole container; keep port 22 on your LAN |
 | sudo | Optional, password required; `agentic-doctor` warns if a NOPASSWD rule appears | Admin work stays with you; Claude can't type the password |
 | Web UI | Runs as the user; own login; listens on the machine only unless you chose LAN at deploy, and starts only after setup is finished | Plain HTTP on port 3001: use an SSH tunnel, or keep LAN access to a trusted network or behind a TLS reverse proxy |
 | Phone alerts | Off unless you set an ntfy topic; settings file is root-only | A guessable topic would let others read your alerts |

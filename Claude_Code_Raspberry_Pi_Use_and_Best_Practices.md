@@ -34,7 +34,7 @@ The comment block at the top of each script has a "Where things live" list of ev
 4. **Create your own account** in Raspberry Pi Imager or the first-boot wizard. That account is the natural choice for the Claude user, because it's the one the desktop logs in as.
 5. **Run the script** from a terminal on the Pi: `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh` (or the Pi 4 one). It asks all its questions first and changes nothing until you answer "Proceed? y".
 
-The script asks for the hostname, timezone, root password, the Claude user, optional ntfy alerts, whether to install Claude Desktop, and whether the web UI is reachable from the Pi only (the default) or from your LAN. The Pi 5 script also asks for the memory profile, the web UI and the 4K-page kernel; the Pi 4 script asks about its boot tuning instead. Both are safe to run again: existing users, settings and shell blocks are kept and installed parts are skipped.
+The script asks for the hostname, timezone, root password, whether root may use SSH with a key only (the default) or with its password too, the Claude user, optional ntfy alerts, whether to install Claude Desktop, and whether the web UI is reachable from the Pi only (the default) or from your LAN. The Pi 5 script also asks for the memory profile, the web UI and the 4K-page kernel; the Pi 4 script asks about its boot tuning instead. Both are safe to run again: existing users, settings and shell blocks are kept and installed parts are skipped.
 
 ## Pi 5 memory profiles (4gb and 8gb)
 
@@ -155,7 +155,7 @@ There's no container around Claude here, so the user account is the boundary. Cl
 | sudo | Optional, and asks for a password. Raspberry Pi OS gives the first user passwordless sudo; the script checks every sudoers file for a NOPASSWD rule that covers the user (directly, through ALL, or through a group such as `sudo`) and offers to remove it, checking each edit with `visudo`. `agentic-doctor` warns if one comes back | Admin work stays with you; Claude can't type the password |
 | Claude permissions | Auto mode, plus deny rules for secrets and credential files (~/.ssh, gh, git, npm), `dd`, `mkfs`, `rm -rf /`, `sudo` and `su` | Claude can't read credentials or escalate on its own |
 | npm install scripts | Allowed only for the web UI's four native modules; the weekly tool updates run with none | A compromised package can't run code as root when it's installed |
-| SSH | Root and the user log in with a password or key; at most 4 tries per connection | Convenient; keep port 22 on your LAN |
+| SSH | The user logs in with a password or key. Root is key only unless you choose "password" at deploy, which the script warns against (each re-run asks again); at most 4 tries per connection | A guessable root password over the network would be the whole Pi; keep port 22 on your LAN |
 | Web UI | Runs as the user; own login; optional on the Pi 5; listens on the Pi only unless you chose LAN at deploy, and starts only after setup is finished | Plain HTTP on port 3001: use an SSH tunnel, or keep LAN access to a trusted network or behind a TLS reverse proxy |
 | Phone alerts | Off unless you set an ntfy topic; settings file is root-only | A guessable topic would let others read your alerts |
 | Updates | Weekly, with health check | Keeps the OS, Pi firmware, Claude Desktop and Claude Code patched |
@@ -164,7 +164,7 @@ Further hardening you can add:
 
 - Turn on the firewall (`sudo apt install ufw`, `sudo ufw allow from <your-lan> to any port 22 proto tcp`, plus port 3001 if you chose LAN access for the web UI, then `sudo ufw enable`).
 - Use SSH keys, and set PasswordAuthentication no in /etc/ssh/sshd_config.d/00-agentic.conf once they work.
-- If you never need root over SSH, set PermitRootLogin no in that same file.
+- If you never need root over SSH, set PermitRootLogin no in that same file. (Re-running the script resets it to your key-only or password choice.)
 
 ## Troubleshooting
 
