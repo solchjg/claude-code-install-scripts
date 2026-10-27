@@ -6,13 +6,25 @@ Deployer scripts that turn a machine into a fully provisioned Claude Code
 development box, run as one normal (non-root) user, plus a use and
 best-practices guide for each platform.
 
-Clone the repo onto the target machine (Use `gh repo clone` or an authenticated `git clone`), 
-then run the script for your platform as root.
+## Getting the scripts
+
+The repository is public, so no GitHub login is needed. Either clone the
+whole repo onto the target machine:
 
 ```bash
-gh repo clone solchjg/claude-code-install-scripts
+git clone https://github.com/solchjg/claude-code-install-scripts.git
 cd claude-code-install-scripts
 ```
+
+or download just the script for your platform, for example the Pi 5 one:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/solchjg/claude-code-install-scripts/main/Claude_Code_Raspberry_Pi_5_Deployer.sh
+```
+
+Swap in any script name from the table below. These scripts run as root and
+change a lot of the system, so read the script before you run it, rather than
+piping it straight into `sudo bash`. Then run it with the command in the table.
 
 ## Scripts
 
