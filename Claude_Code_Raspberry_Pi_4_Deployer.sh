@@ -30,7 +30,7 @@
 #   makes apt, cargo and npm painfully slow.
 #
 # GitHub: https://github.com/solchjg/claude-code-install-scripts
-# Based on the original by serversathome: https://github.com/serversathome/ServersatHome
+# Based on the original by serversathome: https://github.com/serversathome/claudelxc
 #
 # How it runs (see main() at the bottom):
 #   1. Interactive: check the Pi/OS, then ask for the hostname, timezone, the

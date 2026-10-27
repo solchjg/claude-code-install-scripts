@@ -8,7 +8,7 @@
 #   curl -fsSLO https://raw.githubusercontent.com/solchjg/claude-code-install-scripts/main/Claude_Code_LXC_Deployer_for_Proxmox.sh && bash Claude_Code_LXC_Deployer_for_Proxmox.sh
 #
 # GitHub: https://github.com/solchjg/claude-code-install-scripts
-# Based on the original by serversathome: https://github.com/serversathome/ServersatHome
+# Based on the original by serversathome: https://github.com/serversathome/claudelxc
 #
 # How it runs (see main() at the bottom):
 #   1. Host side, interactive: ask for the container settings, the root
