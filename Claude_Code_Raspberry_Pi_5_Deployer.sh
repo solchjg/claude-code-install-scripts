@@ -61,7 +61,7 @@
 #   /usr/local/share/agentic/    shared Claude settings template, shell block and
 #                                the staged webapp-testing skill
 #   ~USER/.claude/settings.json  the user's Claude Code settings (auto mode + the
-#                                deny floor); never overwritten by a re-run
+#                                deny floor); a re-run only adds new deny rules
 #   /project/CLAUDE.md           what Claude is told about this box
 #   /etc/agentic/README.md       the notes card (copy: ~USER/CLAUDE-PI.md)
 #   /etc/agentic/memory.env      the memory profile's build-job / Node-heap limits
@@ -1144,13 +1144,17 @@ if [ "$NODE_FRESH" = yes ]; then
   npm install -g "${NPM_QUIET[@]}" npm@latest || echo "    [WARN] npm self-update failed; using bundled npm"
 fi
 echo "    Node.js $(node --version) / npm $(npm --version)"
-# npm 12+ blocks dependencies' install scripts behind an allowlist (separate from
-# ignore-scripts), so native modules like CloudCLI's better-sqlite3/node-pty/
-# bcrypt never compile and the service crash-loops with no bind on :3001. We just
-# took npm to latest (>=12), so set the allowlist NOW, before any native install
-# below (CloudCLI, Playwright, the language servers). It persists to /root/.npmrc
-# under npm 12+; harmless if npm is still <12.
-npm config set dangerously-allow-all-scripts true 2>/dev/null || true
+# npm 12+ blocks packages' install scripts unless they're on an allowlist, so
+# CloudCLI's native modules (better-sqlite3, node-pty, bcrypt) would never
+# compile and the service would crash-loop with nothing on :3001. Allow exactly
+# those four and nothing else: every other global tool here installs without
+# scripts, and a compromised package anywhere else can't run code as root at
+# install time. Set NOW, before the installs below; it persists to /root/.npmrc.
+# npm <12 rejects the key (and runs all scripts anyway), hence the || true.
+# An older deploy's allow-everything setting is removed.
+NPM_ALLOW_SCRIPTS="@cloudcli-ai/cloudcli,bcrypt,better-sqlite3,node-pty"
+npm config delete dangerously-allow-all-scripts 2>/dev/null || true
+npm config set allow-scripts="$NPM_ALLOW_SCRIPTS" 2>/dev/null || true
 
 echo ">>> Installing global npm packages..."
 # Only what's missing, so a re-run doesn't reinstall all of them.
@@ -1176,10 +1180,20 @@ GO_ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
 if [ "$(/usr/local/go/bin/go env GOVERSION 2>/dev/null)" = "$GO_VERSION" ]; then
   echo "    $GO_VERSION already installed; skipping download"
 else
-  curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
+  # Downloaded into a fresh private temp dir, and checked against the sha256
+  # go.dev publishes for this exact file before anything is unpacked.
+  GO_TGZ="${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
+  GO_SHA="$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r --arg f "$GO_TGZ" '.[].files[] | select(.filename == $f) | .sha256')"
+  GO_TMP="$(mktemp -d)"
+  curl -fsSL "https://go.dev/dl/$GO_TGZ" -o "$GO_TMP/go.tar.gz"
+  if [ -z "$GO_SHA" ] || ! echo "$GO_SHA  $GO_TMP/go.tar.gz" | sha256sum -c --quiet -; then
+    rm -rf "$GO_TMP"
+    echo "!!! $GO_TGZ doesn't match the checksum on go.dev; not installing it"
+    exit 1
+  fi
   rm -rf /usr/local/go
-  tar -C /usr/local -xzf /tmp/go.tar.gz
-  rm /tmp/go.tar.gz
+  tar -C /usr/local -xzf "$GO_TMP/go.tar.gz"
+  rm -rf "$GO_TMP"
 fi
 # Written, not appended, so re-runs don't stack duplicate PATH lines.
 echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
@@ -1279,6 +1293,12 @@ cat > /usr/local/share/agentic/claude-settings.json << 'SETTINGS'
       "Read(**/*.pem)",
       "Read(**/id_rsa)",
       "Read(**/id_ed25519)",
+      "Read(**/id_ecdsa)",
+      "Read(~/.ssh/**)",
+      "Read(~/.config/gh/hosts.yml)",
+      "Read(~/.git-credentials)",
+      "Read(~/.netrc)",
+      "Read(~/.npmrc)",
       "Bash(dd *)",
       "Bash(mkfs*)",
       "Bash(rm -rf / *)",
@@ -1344,13 +1364,16 @@ echo ">>> Staging webapp-testing skill (from anthropics/skills)..."
 # Installed as a plain user skill (NOT a marketplace plugin). A SKILL.md placed
 # under ~/.claude/skills/ is picked up automatically with no plugin entry needed.
 # Staged here; agentic-setup-user copies it into the user's ~/.claude/skills.
-git clone --depth 1 --filter=blob:none --sparse https://github.com/anthropics/skills.git /tmp/anthropic-skills
-cd /tmp/anthropic-skills && git sparse-checkout set skills/webapp-testing
+# Cloned into a fresh private temp dir (a fixed /tmp path could already exist,
+# left over or made by someone else, and stop a re-run).
+SKILLS_TMP="$(mktemp -d)"
+git clone --depth 1 --filter=blob:none --sparse https://github.com/anthropics/skills.git "$SKILLS_TMP/skills"
+cd "$SKILLS_TMP/skills" && git sparse-checkout set skills/webapp-testing
 rm -rf /usr/local/share/agentic/skills/webapp-testing
-cp -r /tmp/anthropic-skills/skills/webapp-testing /usr/local/share/agentic/skills/webapp-testing
+cp -r "$SKILLS_TMP/skills/skills/webapp-testing" /usr/local/share/agentic/skills/webapp-testing
 chmod -R a+rX /usr/local/share/agentic
-rm -rf /tmp/anthropic-skills
 cd /
+rm -rf "$SKILLS_TMP"
 
 echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
 # The webapp-testing skill imports the PYTHON playwright package
@@ -1369,6 +1392,14 @@ echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
 # set +e: until the matching set -e below, a failing command doesn't stop the run.
 set +e
 unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
+# The browser cache is root's: root downloads into it and the users can only
+# read it, so nothing planted there can redirect a root write. An older deploy
+# gave it to the Claude user; such a copy is deleted and downloaded again
+# rather than written into.
+if [ -d /opt/ms-playwright ] && find /opt/ms-playwright ! -user root -print -quit | grep -q .; then
+  echo "    taking /opt/ms-playwright back from the user (re-downloading Chromium)"
+  rm -rf /opt/ms-playwright
+fi
 # Re-runs: skip when the package imports and its Chromium is already in the
 # shared cache (pip without -U never changes the version, so they still match).
 # Skip only when BOTH are there: the pip package imports AND a Chromium
@@ -1379,18 +1410,16 @@ else
   pip install --break-system-packages --root-user-action=ignore -q playwright \
     && echo "    python playwright package installed" \
     || echo "    [WARN] pip install playwright failed (webapp-testing skill will error on import)"
-  # The browser cache belongs to the Claude user, so the browser download runs
-  # AS the user (root never writes into a folder the user controls); only
-  # the OS libraries Chromium needs (install-deps, via apt) run as root.
-  install -d -m 755 -o "$AGENTIC_PRIMARY" -g "$AGENTIC_PRIMARY" /opt/ms-playwright
+  # Chromium's OS libraries (install-deps, via apt) and the browser itself, both
+  # as root into the root-owned cache.
+  install -d -m 755 /opt/ms-playwright
   python3 -m playwright install-deps chromium \
     || echo "    [WARN] some of Chromium's OS libraries didn't install (browser tests may fail)"
-  if (cd / && runuser -u "$AGENTIC_PRIMARY" -- env HOME="$(getent passwd "$AGENTIC_PRIMARY" | cut -d: -f6)" \
-        PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install chromium); then
+  if PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install chromium; then
     echo "    Playwright chromium installed in /opt/ms-playwright"
   else
-    echo "    [WARN] Playwright browser install failed. Retry later as $AGENTIC_PRIMARY with:"
-    echo "      PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install chromium"
+    echo "    [WARN] Playwright browser install failed. Retry later with:"
+    echo "      sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install chromium"
   fi
 fi
 set -e
@@ -1644,10 +1673,11 @@ as_user() {
 echo ">>> [$u] npm config..."
 # prefix: `npm i -g` as this user lands in ~/.local (already on PATH) instead of
 # failing on the root-owned /usr/lib/node_modules. The install-script allowlist
-# (npm 12+) is per user too — CloudCLI's in-app plugin installs run as this
-# user and need it.
+# (npm 12+) is per user too, and gets the same four CloudCLI native modules as
+# root's; anything else asks first (`npm approve-scripts` in that project).
 as_user npm config set prefix "$h/.local"
-as_user npm config set dangerously-allow-all-scripts true 2>/dev/null || true
+as_user npm config delete dangerously-allow-all-scripts 2>/dev/null || true
+as_user npm config set allow-scripts="@cloudcli-ai/cloudcli,bcrypt,better-sqlite3,node-pty" 2>/dev/null || true
 
 echo ">>> [$u] Installing Claude Code (native installer)..."
 CLAUDE_BIN="$h/.local/bin/claude"
@@ -1672,11 +1702,26 @@ echo "    Claude Code installed: $(as_user "$CLAUDE_BIN" --version 2>/dev/null |
 # it never follows symlinks.
 # ~/.claude is private (it holds the login). The shared settings template is
 # copied only when the user has no settings.json yet, so yours is never
-# overwritten by a re-run.
+# overwritten by a re-run. An existing one only gains the template's deny rules
+# it doesn't have yet (new secret paths added to this script); everything else
+# in it is left alone. (So a template deny rule you deleted comes back on the
+# next run; deny always beats allow, so edit the template above to drop one.)
 if [ -e "$h/.claude" ]; then chown -R "$u:$u" "$h/.claude"; fi
 as_user install -d -m 700 "$h/.claude"
 as_user install -d "$h/.claude/skills"
 as_user sh -c '[ -e "$1" ] || install -m 644 "$2" "$1"' sh "$h/.claude/settings.json" "$SHARE/claude-settings.json"
+# jq: append each template deny rule that's missing, keeping the file's order.
+# Written only if something changed and the result is valid; a settings.json
+# jq can't parse is left as it is.
+DENY_MERGE='(.permissions.deny // []) as $d | .permissions.deny = $d + [$t[0].permissions.deny[] | select(. as $x | $d | index($x) | not)]'
+as_user bash -c 'f="$1"; [ -f "$f" ] && [ ! -L "$f" ] || exit 0
+  n="$(mktemp "$f.XXXXXX")" || exit 0
+  if jq --slurpfile t "$2" "$3" "$f" > "$n" 2>/dev/null \
+     && [ "$(jq ".permissions.deny | length" "$n")" != "$(jq ".permissions.deny | length" "$f")" ]; then
+    chmod 644 "$n" && mv "$n" "$f" && echo "    added new deny rules to settings.json"
+  else
+    rm -f "$n"
+  fi' sh "$h/.claude/settings.json" "$SHARE/claude-settings.json" "$DENY_MERGE"
 
 echo ">>> [$u] Adding plugin marketplaces..."
 # The official marketplace is auto-registered on first INTERACTIVE launch only,
@@ -1843,17 +1888,17 @@ npm ls -g --depth=0 playwright >/dev/null 2>&1 \
   || npm install -g "${NPM_QUIET[@]}" playwright \
   || echo "    [WARN] global Playwright install failed (CloudCLI Browser feature won't work)"
 # The build this Playwright version wants (a no-op when it's already there),
-# downloaded as the user who owns the browser cache.
-(cd / && runuser -u "$AGENTIC_PRIMARY" -- env HOME="$PRIMARY_HOME" PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin playwright install chromium) \
-  || echo "    [WARN] Chromium download failed; retry later as $AGENTIC_PRIMARY with: PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install chromium"
+# into the root-owned browser cache.
+install -d -m 755 /opt/ms-playwright
+PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install chromium \
+  || echo "    [WARN] Chromium download failed; retry later with: sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install chromium"
 else
   echo ">>> CloudCLI web UI skipped (memory profile $AGENTIC_MEMPROFILE; chosen at the prompt)"
 fi
-# Browser cache owned by the Claude user, so their own Playwright (a pip --user
-# or project install wanting a different browser build) can add to it.
+# The browser cache stays root's and readable by everyone. A project that pins
+# a different Playwright version can keep its own browsers in the user's home:
+# PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright npx playwright install.
 if [ -d /opt/ms-playwright ]; then
-  chown -R "$AGENTIC_PRIMARY:$AGENTIC_PRIMARY" /opt/ms-playwright
   chmod -R a+rX /opt/ms-playwright
 fi
 
@@ -2202,8 +2247,6 @@ if [ "$AGENTIC_MEMPROFILE" = 4gb ]; then
   # after a deploy usually just means rpi-swap's new size waits for a reboot.
   note "4gb: zram at least 75% of RAM (reboot after deploy if WARN)" \
     "[ \$(( \$(swapon --noheadings --bytes --show=NAME,SIZE | awk '/zram/{s+=\$2} END{print s+0}') / 1024 )) -ge \$(( \$(awk '/MemTotal/{print \$2}' /proc/meminfo) * 3 / 4 )) ]"
-fi
-if [ "$AGENTIC_MEMPROFILE" = 4gb ]; then
   note "4gb sysctls live (swappiness 150)" "[ \$(cat /proc/sys/vm/swappiness) -eq 150 ]"
   # On 4 GB, 1 GB free is a lot to ask; 512 MB is the "about to thrash" line.
   note "over 512 MB memory available" "[ \$(awk '/MemAvailable/{print \$2}' /proc/meminfo) -gt 524288 ]"
@@ -2266,47 +2309,50 @@ apt-get update -qq && apt-get full-upgrade -y -qq && apt-get autoremove -y -qq &
   || echo "    [WARN] OS package update failed"
 
 echo ">>> [2/6] npm + global dev tools (incl. Playwright) + gopls..."
-npm install -g --no-fund --no-audit --loglevel=error npm@latest || echo "    [WARN] npm self-update failed"
-# npm 12+ blocks dependencies' install scripts behind an allowlist (separate
-# from ignore-scripts), so CloudCLI's native deps (better-sqlite3/node-pty/
-# bcrypt) never compile -> cloudcli crash-loops and nothing binds :3001. This
-# weekly run can move npm up a major version above, so the config is set again
-# here -- AFTER npm@latest lands (it only persists to /root/.npmrc under npm
-# 12+) and BEFORE the cloudcli reinstall/rebuild below.
-# The user gets it too: CloudCLI's in-app plugin installs run as them.
-npm config set dangerously-allow-all-scripts true 2>/dev/null || true
+npm install -g --no-fund --no-audit --loglevel=error --ignore-scripts npm@latest || echo "    [WARN] npm self-update failed"
+# npm 12+ only runs install scripts for packages on an allowlist. Allow just
+# CloudCLI's native modules (better-sqlite3, node-pty, bcrypt), which must
+# compile or cloudcli crash-loops with nothing on :3001. Set again on every run
+# (after npm@latest, in case npm just reached 12, and before the CloudCLI step
+# below), and an older allow-everything setting is removed. The users get the
+# same list: CloudCLI's in-app plugin installs run as them.
+NPM_ALLOW_SCRIPTS="@cloudcli-ai/cloudcli,bcrypt,better-sqlite3,node-pty"
+npm config delete dangerously-allow-all-scripts 2>/dev/null || true
+npm config set allow-scripts="$NPM_ALLOW_SCRIPTS" 2>/dev/null || true
 for u in $AGENTIC_USERS; do
-  as_user "$u" npm config set dangerously-allow-all-scripts true >/dev/null 2>&1 || true
+  as_user "$u" npm config delete dangerously-allow-all-scripts >/dev/null 2>&1 || true
+  as_user "$u" npm config set allow-scripts="$NPM_ALLOW_SCRIPTS" >/dev/null 2>&1 || true
 done
 # The global dev tools and npm-based language servers the deployer installed
 # (re-running the deployer skips them, so they're kept current here). Only the
 # ones still installed are touched; CloudCLI has its own step below.
 # Builds a <pkg>@latest list of the tools that are still installed, so one
-# npm call updates them all; a tool you uninstalled is not brought back.
+# npm call updates them all; a tool you uninstalled is not brought back. None
+# of them needs an install script, so they run with --ignore-scripts: root
+# runs this unattended every week, and that keeps a compromised release of any
+# package in their trees from running code at install time.
 NPM_TOOLS=()
 for pkg in typescript ts-node eslint prettier typescript-language-server pyright playwright; do
   npm ls -g --depth=0 "$pkg" >/dev/null 2>&1 && NPM_TOOLS+=("${pkg}@latest")
 done
 if [ ${#NPM_TOOLS[@]} -gt 0 ]; then
-  npm install -g --no-fund --no-audit --loglevel=error "${NPM_TOOLS[@]}" \
+  npm install -g --no-fund --no-audit --loglevel=error --ignore-scripts "${NPM_TOOLS[@]}" \
     && echo "    updated: ${NPM_TOOLS[*]}" \
     || echo "    [WARN] global dev tool update failed"
 fi
 # Playwright: the pip package follows the npm one to its latest release, then
-# the Chromium build each one wants is fetched. That download runs as whoever
-# owns the browser cache (the Claude user), so root never writes into a folder
-# the user controls.
+# the Chromium build each one wants is fetched into the root-owned cache. A
+# cache an older deploy gave to the Claude user is deleted and downloaded again
+# rather than written into, so nothing planted there can redirect a root write.
 if python3 -c 'import playwright' >/dev/null 2>&1; then
   pip install -U -q --break-system-packages --root-user-action=ignore playwright \
     || echo "    [WARN] pip playwright update failed"
 fi
-PW_OWNER="$(stat -c %U /opt/ms-playwright 2>/dev/null || echo root)"
+if [ -d /opt/ms-playwright ] && find /opt/ms-playwright ! -user root -print -quit | grep -q .; then
+  rm -rf /opt/ms-playwright && install -d -m 755 /opt/ms-playwright
+fi
 pw_chromium() {  # pw_chromium <playwright command...>: fetch the Chromium it wants
-  if [ "$PW_OWNER" = root ]; then
-    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright "$@" install chromium
-  else
-    as_user "$PW_OWNER" env PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright "$@" install chromium
-  fi
+  PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright "$@" install chromium
 }
 if [ -d /opt/ms-playwright ]; then
   if command -v playwright >/dev/null 2>&1; then
@@ -2315,6 +2361,7 @@ if [ -d /opt/ms-playwright ]; then
   if python3 -c 'import playwright' >/dev/null 2>&1; then
     pw_chromium python3 -m playwright >/dev/null || echo "    [WARN] Chromium download for the Python Playwright failed"
   fi
+  chmod -R a+rX /opt/ms-playwright
 fi
 # gopls, the Go language server behind the gopls-lsp plugin (only when the
 # deployer installed it).
