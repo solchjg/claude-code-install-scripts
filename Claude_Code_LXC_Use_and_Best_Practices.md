@@ -124,7 +124,7 @@ The container is the security boundary. Inside it, Claude runs as a normal user 
 
 | Layer | What the script does | Why |
 | --- | --- | --- |
-| Container | Unprivileged by default (asked at deploy), with only `nesting=1`: no Docker, no keyctl and the default AppArmor profile | Container root maps to an unprivileged host UID, so an escape doesn't own the host |
+| Container | Unprivileged unless you type `privileged` at deploy, with only `nesting=1`: no Docker, no keyctl and the default AppArmor profile | Container root maps to an unprivileged host UID, so an escape doesn't own the host |
 | Claude user | Normal account; root is blocked from running `claude` | Limits what an agent mistake touches |
 | Claude permissions | Auto mode, plus deny rules for secrets and credential files (~/.ssh, gh, git, npm), `dd`, `mkfs`, `rm -rf /`, `sudo` and `su` | Claude can't read credentials or escalate on its own |
 | npm install scripts | Allowed only for the web UI's four native modules; the weekly tool updates run with none | A compromised package can't run code as root when it's installed |

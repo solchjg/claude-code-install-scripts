@@ -104,6 +104,11 @@ start_logging() {
 # it survives even if you destroy the half-built container afterwards.
 on_exit() {
   local rc=$?
+  # The host-side copies of the env (ntfy token) and password files only live
+  # between writing and `pct push`; if the run died in between, remove them.
+  if [[ -n "${CT_ID:-}" ]]; then
+    rm -f "/tmp/provision-${CT_ID}.env" "/tmp/provision-${CT_ID}.chpasswd" "/tmp/provision-${CT_ID}.sh"
+  fi
   [[ $rc -eq 0 ]] && return 0
   echo ""
   echo -e "${RED}[ERROR]${NC} Install failed (exit $rc). Host log: $DEPLOY_LOG"
@@ -224,6 +229,19 @@ get_config() {
   if [[ -n "$CT_SSH_KEY" && ! -f "$CT_SSH_KEY" ]]; then
     error "SSH public key not found: $CT_SSH_KEY"
   fi
+  # It must be ONE public key line ("ssh-ed25519 AAAA... comment"). Giving the
+  # private key by mistake (id_ed25519 instead of id_ed25519.pub) would copy it
+  # onto this machine and into authorized_keys, so that's refused outright.
+  if [[ -n "$CT_SSH_KEY" ]]; then
+    if grep -q 'PRIVATE KEY' "$CT_SSH_KEY"; then
+      error "$CT_SSH_KEY is a PRIVATE key. Give the public one instead (${CT_SSH_KEY%.pub}.pub); nothing was changed."
+    fi
+    if [[ "$(grep -cv '^[[:space:]]*$' "$CT_SSH_KEY")" -ne 1 ]] \
+       || ! grep -qE '^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp[0-9]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/=]+' "$CT_SSH_KEY" \
+       || { command -v ssh-keygen >/dev/null 2>&1 && ! ssh-keygen -l -f "$CT_SSH_KEY" >/dev/null 2>&1; }; then
+      error "$CT_SSH_KEY isn't a single SSH public key line (like the contents of ~/.ssh/id_ed25519.pub)."
+    fi
+  fi
 
   # ntfy push alerts (optional). When agentic-update or agentic-doctor hits a
   # WARN/FAIL, agentic-errorlog writes Agentic-Errors.txt as always and, if a
@@ -255,7 +273,16 @@ get_config() {
   # single biggest hardening step for an LXC that runs an auto-mode agent.
   # Nothing in this build needs a privileged container; keep the default.
   read -rp "Unprivileged container (recommended)? [Y/n]: " CT_UNPRIV
-  [[ "$CT_UNPRIV" =~ ^[Nn] ]] && CT_UNPRIV=0 || CT_UNPRIV=1
+  if [[ "$CT_UNPRIV" =~ ^[Nn] ]]; then
+    # Privileged means container root IS Proxmox host root, so an agent that
+    # ever reaches root in here owns the host. Make that a deliberate choice.
+    warn "A privileged container's root is the Proxmox host's root. Nothing here needs it."
+    local priv_ans
+    read -rp "Type 'privileged' to confirm, or press Enter for unprivileged: " priv_ans
+    [[ "$priv_ans" == privileged ]] && CT_UNPRIV=0 || CT_UNPRIV=1
+  else
+    CT_UNPRIV=1
+  fi
 
   # The ONE normal (non-root) user that runs Claude Code. Required, no default.
   # One person per container: a container is cheap, and users sharing one would
