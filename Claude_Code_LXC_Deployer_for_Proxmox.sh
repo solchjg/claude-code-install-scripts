@@ -156,8 +156,7 @@ resolve_template() {
 }
 
 # ── Configuration ───────────────────────────────────────────────────────────
-# Asks everything up front (nothing is created until "Proceed? y"), so the rest
-# of the run is unattended. Sets the CT_* globals used by every later step.
+
 # Ask how root may log in over SSH. "key" (the default) is PermitRootLogin
 # prohibit-password: root needs an SSH key, and its password is never accepted
 # over the network (the console and `su -` still take it). "password" keeps
@@ -204,6 +203,8 @@ ask_webui_bind() {   # $1 = what "local" means here, e.g. "this machine"
   done
 }
 
+# Asks everything up front (nothing is created until "Proceed? y"), so the rest
+# of the run is unattended. Sets the CT_* globals used by every later step.
 get_config() {
   # Find next available CT ID
   local next_id
@@ -2033,6 +2034,11 @@ uninstall() {
   [[ -n "$id" ]] || { info "Cancelled; nothing was changed."; exit 0; }
   [[ "$id" =~ ^[0-9]+$ ]] && pct status "$id" >/dev/null 2>&1 || error "No container with ID $id."
   name="$(pct config "$id" | awk '/^hostname:/{print $2}')"
+  # Proxmox refuses to destroy a protected container; say how to fix that up
+  # front instead of failing after the confirmation.
+  if pct config "$id" | grep -q '^protection: 1'; then
+    error "Container $id ($name) has Protection turned on. Turn it off first (Options > Protection in the web UI, or: pct set $id --protection 0), then run --uninstall again."
+  fi
   if [[ " $ids " != *" $id "* ]]; then
     warn "Container $id ($name) doesn't carry this script's notes card. Make sure it's the right one."
   fi
@@ -2047,12 +2053,28 @@ uninstall() {
   success "Container $id ($name) deleted. Install logs are still in /var/log/agentic-deploy/."
 }
 
+# ── Command line ────────────────────────────────────────────────────────────
+# One optional argument. Anything else stops with the usage text, so a typo
+# such as --uninstal can never start a full install by mistake.
+usage() {
+  cat <<USAGE
+Usage: bash Claude_Code_LXC_Deployer_for_Proxmox.sh [--uninstall | --help]
+
+  (no option)    Asks a few questions, then creates and sets up a new Claude Code container.
+  --uninstall    Lists the containers this script made and deletes the one you pick
+                 (you type its ID twice). Nothing else on the host changes.
+  --help, -h     Show this text.
+USAGE
+}
+
 main() {
-  if [[ "${1:-}" == --uninstall ]]; then
-    header
-    uninstall
-    exit 0
-  fi
+  [[ $# -le 1 ]] || { usage >&2; error "Give at most one option."; }
+  case "${1:-}" in
+    "") ;;                                   # normal install, below
+    --uninstall) header; uninstall; exit 0 ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           usage >&2; error "Unknown option: $1" ;;
+  esac
   header
   preflight
   get_config

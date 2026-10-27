@@ -242,9 +242,7 @@ preflight() {
 }
 
 # ── Configuration ───────────────────────────────────────────────────────────
-# Asks everything up front (nothing is changed until "Proceed? y"), so the rest
-# of the run is unattended. Sets the PI_* / CT_* globals used by every later
-# step (CT_* names kept from the Proxmox deployer so the shared parts line up).
+
 # Ask how root may log in over SSH. "key" (the default) is PermitRootLogin
 # prohibit-password: root needs an SSH key, and its password is never accepted
 # over the network (the console and `su -` still take it). "password" keeps
@@ -290,6 +288,9 @@ ask_webui_bind() {   # $1 = what "local" means here, e.g. "this machine"
   done
 }
 
+# Asks everything up front (nothing is changed until "Proceed? y"), so the rest
+# of the run is unattended. Sets the PI_* / CT_* globals used by every later
+# step (CT_* names kept from the Proxmox deployer so the shared parts line up).
 get_config() {
   echo -e "${BOLD}Pi Configuration${NC}"
   echo "─────────────────────────────────────────────────"
@@ -1403,6 +1404,17 @@ echo ">>> Configuring SSH..."
 # unless "password" was chosen at the prompt. MaxAuthTries caps guesses per
 # connection.
 if [ "${AGENTIC_ROOT_SSH:-key}" = password ]; then ROOT_LOGIN=yes; else ROOT_LOGIN=prohibit-password; fi
+# Save the main file's original two lines on the first run only (re-runs
+# would save our own edits; a box deployed by an older version, which already
+# has our drop-in, is skipped for the same reason), so --uninstall can put
+# them back as they were.
+if [ ! -f /etc/agentic/sshd-original ] && [ ! -f /etc/ssh/sshd_config.d/00-agentic.conf ] \
+   && [ -f /etc/ssh/sshd_config ]; then
+  mkdir -p /etc/agentic
+  { grep -m1 -E '^#*PermitRootLogin' /etc/ssh/sshd_config || true
+    grep -m1 -E '^#*PasswordAuthentication' /etc/ssh/sshd_config || true
+  } > /etc/agentic/sshd-original
+fi
 sed -i "s/^#*PermitRootLogin.*/PermitRootLogin $ROOT_LOGIN/" /etc/ssh/sshd_config
 sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
 # Claude Desktop's SSH sessions copy files over SFTP; Ubuntu ships the line, but
@@ -2587,19 +2599,33 @@ uninstall() {
         /usr/local/bin/agentic-doctor /usr/local/bin/agentic-errorlog
   # The root 'claude' stub, only if it's ours (it points root at the user).
   if grep -qs 'not run as root on this box' /usr/local/bin/claude; then rm -f /usr/local/bin/claude; fi
+  # Read what the deploy saved before /etc/agentic goes: the main sshd_config's
+  # original PermitRootLogin / PasswordAuthentication lines (used further down).
+  # Boxes deployed before that file existed get the OS's commented defaults.
+  local ssh_orig_root="#PermitRootLogin prohibit-password" ssh_orig_pw="#PasswordAuthentication yes"
+  if [[ -f /etc/agentic/sshd-original ]]; then
+    ssh_orig_root="$(grep -m1 'PermitRootLogin' /etc/agentic/sshd-original || true)"
+    ssh_orig_pw="$(grep -m1 'PasswordAuthentication' /etc/agentic/sshd-original || true)"
+  fi
   rm -rf /usr/local/share/agentic /etc/agentic
   rm -f /etc/profile.d/agentic.sh /etc/apt/apt.conf.d/99agentic-lock-wait /etc/apt/preferences.d/agentic-no-cowork-vm
   [[ -f /etc/environment ]] && sed -i -E '/^RUSTUP_HOME=\/opt\/rust\/rustup$/d; /^PLAYWRIGHT_BROWSERS_PATH=\/opt\/ms-playwright$/d; /^CARGO_BUILD_JOBS=2$/d' /etc/environment
   git config --system --unset-all safe.directory '^/project(/\*)?$' 2>/dev/null || true
   # npm's install-script allowlist (root's; the user's is below).
   command -v npm >/dev/null 2>&1 && { npm config delete allow-scripts 2>/dev/null || true; }
-  # SSH: drop our drop-in and put the main file's two lines back to Ubuntu's
-  # commented defaults (root by key only, passwords on for everyone else).
-  # Never restart into a config sshd rejects.
+  # SSH: drop our drop-in and put the main file's two lines back the way they
+  # were before the first deploy (read above). An empty saved line means the
+  # file never had one, so the deploy didn't touch it and neither do we.
+  # Values go in through the environment, not awk -v, so a backslash in them
+  # stays a backslash. Never restart into a config sshd rejects.
   rm -f /etc/ssh/sshd_config.d/00-agentic.conf
   if [[ -f /etc/ssh/sshd_config ]]; then
-    sed -i -e 's/^PermitRootLogin .*/#PermitRootLogin prohibit-password/' \
-           -e 's/^PasswordAuthentication .*/#PasswordAuthentication yes/' /etc/ssh/sshd_config
+    ROOT_LINE="$ssh_orig_root" PW_LINE="$ssh_orig_pw" awk '
+      /^PermitRootLogin /        && ENVIRON["ROOT_LINE"] != "" { print ENVIRON["ROOT_LINE"]; next }
+      /^PasswordAuthentication / && ENVIRON["PW_LINE"]   != "" { print ENVIRON["PW_LINE"];   next }
+      { print }' /etc/ssh/sshd_config > /etc/ssh/sshd_config.agentic-new \
+      && cat /etc/ssh/sshd_config.agentic-new > /etc/ssh/sshd_config
+    rm -f /etc/ssh/sshd_config.agentic-new
   fi
   if [[ ! -f /etc/ssh/sshd_config ]]; then
     :
@@ -2608,18 +2634,31 @@ uninstall() {
   else
     warn "sshd's config test failed after the change; check /etc/ssh/sshd_config before the next restart"
   fi
-  # The shell block, from root's .bashrc and (as them) the user's: from its
-  # marker line to its last line, only when both are there.
+  # The shell block, from root's .bashrc and (as them) the user's. The block
+  # runs from its marker line to its closing "cd /project" line. The first awk
+  # checks that both are there, in that order; if someone deleted the closing
+  # line, removing "to the end of the block" would also delete everything
+  # after it, so the file is left alone with a warning instead.
+  local uninstall_bashrc_check='index($0, m) { s=1 } s && $0 == "cd /project 2>/dev/null || true" { f=1 } END { exit !f }'
   local uninstall_bashrc_awk='index($0, m) { skip=1; next } skip && $0 == "cd /project 2>/dev/null || true" { skip=0; next } !skip'
   if grep -qs "── Claude Code Pi ──" /root/.bashrc; then
-    awk -v m="── Claude Code Pi ──" "$uninstall_bashrc_awk" /root/.bashrc > /root/.bashrc.agentic-new && mv /root/.bashrc.agentic-new /root/.bashrc
+    if awk -v m="── Claude Code Pi ──" "$uninstall_bashrc_check" /root/.bashrc; then
+      # cat > (not mv) keeps the file's owner and mode.
+      awk -v m="── Claude Code Pi ──" "$uninstall_bashrc_awk" /root/.bashrc > /root/.bashrc.agentic-new \
+        && cat /root/.bashrc.agentic-new > /root/.bashrc
+      rm -f /root/.bashrc.agentic-new
+    else
+      warn "Left /root/.bashrc alone: its Claude Code block has no closing 'cd /project' line. Remove the block by hand."
+    fi
   fi
   for u in $AGENTIC_USERS; do
     id "$u" >/dev/null 2>&1 || continue
     h="$(getent passwd "$u" | cut -d: -f6)"
     as_claude_user bash -c 'f="$1/.bashrc"; [ -f "$f" ] && [ ! -L "$f" ] && grep -q "$2" "$f" || exit 0
+      awk -v m="$2" "$4" "$f" || exit 1
       awk -v m="$2" "$3" "$f" > "$f.agentic-new" && cat "$f.agentic-new" > "$f"; rm -f "$f.agentic-new"' \
-      sh "$h" "── Claude Code Pi ──" "$uninstall_bashrc_awk" || true
+      sh "$h" "── Claude Code Pi ──" "$uninstall_bashrc_awk" "$uninstall_bashrc_check" \
+      || warn "Left $h/.bashrc alone: its Claude Code block has no closing 'cd /project' line (or the file couldn't be written). Remove the block by hand."
     as_claude_user npm config delete allow-scripts >/dev/null 2>&1 || true
   done
 
@@ -2704,12 +2743,29 @@ uninstall() {
   echo "  Open shells still have the old PATH and settings; log out and back in. Reboot to put swap, memory and boot settings back."
 }
 
+# ── Command line ────────────────────────────────────────────────────────────
+# One optional argument. Anything else stops with the usage text, so a typo
+# such as --uninstal can never start a full install by mistake.
+usage() {
+  cat <<USAGE
+Usage: sudo bash Claude_Code_Raspberry_Pi_4_Deployer.sh [--uninstall | --help]
+
+  (no option)    Asks a few questions, then sets up this machine. Safe to run again:
+                 installed parts are skipped and your settings are kept.
+  --uninstall    Removes what this script set up. Asks before removing toolchains,
+                 apt software or the Claude user's data; keeps the user account.
+  --help, -h     Show this text.
+USAGE
+}
+
 main() {
-  if [[ "${1:-}" == --uninstall ]]; then
-    header
-    uninstall
-    exit 0
-  fi
+  [[ $# -le 1 ]] || { usage >&2; error "Give at most one option."; }
+  case "${1:-}" in
+    "") ;;                                   # normal install, below
+    --uninstall) header; uninstall; exit 0 ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           usage >&2; error "Unknown option: $1" ;;
+  esac
   header
   preflight
   get_config
