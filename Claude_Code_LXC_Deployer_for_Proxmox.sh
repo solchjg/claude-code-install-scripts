@@ -5,9 +5,10 @@
 # run as ONE normal (non-root) user — one person per container
 #
 # Run on your Proxmox host:
-#   curl -fsSL https://raw.githubusercontent.com/serversathome/ServersatHome/main/agentic.sh -o /tmp/agentic.sh && bash /tmp/agentic.sh
+#   curl -fsSLO https://raw.githubusercontent.com/solchjg/claude-code-install-scripts/main/Claude_Code_LXC_Deployer_for_Proxmox.sh && bash Claude_Code_LXC_Deployer_for_Proxmox.sh
 #
-# GitHub: https://github.com/serversathome/ServersatHome
+# GitHub: https://github.com/solchjg/claude-code-install-scripts
+# Based on the original by serversathome: https://github.com/serversathome/ServersatHome
 #
 # How it runs (see main() at the bottom):
 #   1. Host side, interactive: ask for the container settings, the root

@@ -29,7 +29,8 @@
 #   SSD (blue port) if you can — the Pi 4 has no NVMe slot, and an SD card
 #   makes apt, cargo and npm painfully slow.
 #
-# GitHub: https://github.com/serversathome/ServersatHome
+# GitHub: https://github.com/solchjg/claude-code-install-scripts
+# Based on the original by serversathome: https://github.com/serversathome/ServersatHome
 #
 # How it runs (see main() at the bottom):
 #   1. Interactive: check the Pi/OS, then ask for the hostname, timezone, the

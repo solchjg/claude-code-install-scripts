@@ -48,7 +48,8 @@
 #     in the VM plus Options -> QEMU Guest Agent = on in Proxmox lets Proxmox
 #     shut the VM down cleanly and show its IP address.
 #
-# GitHub: https://github.com/serversathome/ServersatHome
+# GitHub: https://github.com/solchjg/claude-code-install-scripts
+# Based on the original by serversathome: https://github.com/serversathome/ServersatHome
 #
 # How it runs (see main() at the bottom):
 #   1. Interactive: check the machine/OS and its hardware virtualization, then
