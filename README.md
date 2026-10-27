@@ -6,8 +6,8 @@ Deployer scripts that turn a machine into a fully provisioned Claude Code
 development box, run as one normal (non-root) user, plus a use and
 best-practices guide for each platform.
 
-Clone the repo onto the target machine (it is private, so use `gh repo clone`
-or an authenticated `git clone`), then run the script for your platform as root.
+Clone the repo onto the target machine (Use `gh repo clone` or an authenticated `git clone`), 
+then run the script for your platform as root.
 
 ```bash
 gh repo clone solchjg/claude-code-install-scripts
