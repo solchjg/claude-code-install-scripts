@@ -520,8 +520,8 @@ get_config() {
   [[ "$CT_WEBUI" == no && "$webui_installed" == yes ]] && CT_WEBUI_REMOVE=yes
   echo ""
 
-  # Either session folder counts (ls needed BOTH to match, so an X11-only or
-  # Wayland-only desktop was wrongly reported as missing).
+  # A desktop counts when EITHER folder has a session file, so an X11-only or
+  # Wayland-only desktop is found too.
   # compgen -G <glob> prints the matching files and succeeds only when at
   # least one exists; unlike ls, an empty or missing folder is not an error.
   if compgen -G '/usr/share/wayland-sessions/*.desktop' >/dev/null || compgen -G '/usr/share/xsessions/*.desktop' >/dev/null; then
@@ -650,20 +650,20 @@ unset LC_ALL LANGUAGE
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo ">>> Waiting for first-boot apt jobs to finish..."
-# A freshly flashed Pi kicks off apt-daily / unattended-upgrades (and cloud-init
-# on Ubuntu) right after the first boot, and they hold the apt/dpkg locks — our first
-# apt-get then dies with "Could not get lock /var/lib/apt/lists/lock". Pause the
-# timers so nothing new starts mid-provision, wait out a job that really holds
-# the apt/dpkg lock, and tell apt itself to wait on a held lock rather than fail.
+# A freshly flashed Pi kicks off apt-daily / unattended-upgrades (and
+# cloud-init on Ubuntu) right after the first boot, and they hold the apt/dpkg
+# locks, so our first apt-get would die with "Could not get lock
+# /var/lib/apt/lists/lock". Pause the timers so nothing new starts
+# mid-provision, wait out a job that really holds the apt/dpkg lock, and tell
+# apt itself to wait on a held lock rather than fail.
 systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 command -v cloud-init >/dev/null 2>&1 && timeout 120 cloud-init status --wait >/dev/null 2>&1 || true
-# Wait only while a process actually HOLDS one of apt/dpkg's lock files. The
-# old check matched process NAMES, and 'unattended-upgr' is always running on
-# a normal install: unattended-upgrades.service keeps its shutdown helper
-# (unattended-upgrade-shutdown --wait-for-signal) alive all day, so every run
-# sat out the full 10 minutes for nothing. Now: who holds a lock is printed,
-# and after 3 minutes we carry on anyway — apt's own DPkg::Lock::Timeout
-# (set just below) then waits for the lock instead of failing.
+# Wait only while a process actually HOLDS one of apt/dpkg's lock files.
+# Matching process names doesn't work: unattended-upgrades keeps a shutdown
+# helper (unattended-upgrade-shutdown --wait-for-signal) running all day, so a
+# name check would always wait the full time for nothing. Who holds a lock is
+# printed, and after 3 minutes we carry on anyway; apt's own
+# DPkg::Lock::Timeout (set just below) then waits for the lock instead of failing.
 # The four lock files apt and dpkg take: lock-frontend (any apt/dpkg front
 # end), lock (the dpkg database), lists/lock (apt update) and archives/lock
 # (package downloads). A process holding any of them means apt is busy.
@@ -949,8 +949,7 @@ if [ -n "$MEM_OLD" ]; then
   rm -f /etc/environment.agentic-new
 fi
 grep -E '^[A-Za-z_]+=' /etc/agentic/memory.env >> /etc/environment || true
-# (Plain if/else: the old one-liner used ${X:+...}${X:-...}, which printed the
-# number twice — "1536 MB1536" — whenever a cap was set.)
+# The heap cap for the summary line: "<n> MB", or "Node default" when unset.
 if [ -n "$NODE_HEAP_MB" ]; then HEAP_TXT="${NODE_HEAP_MB} MB"; else HEAP_TXT="Node default"; fi
 echo "    build jobs: ${MEM_JOBS:-all cores}; Node heap cap: $HEAP_TXT"
 # The rest of THIS run (npm, go install, rustup, Playwright) honours the limits
@@ -1149,8 +1148,9 @@ rm -f /root/agentic-provision.env
 
 echo ">>> Setting up the shared toolchain environment..."
 # Toolchains are installed once, system-wide (root-owned, updated by
-# agentic-update); the user's shells and the CloudCLI service point at them. /etc/environment covers PAM logins (SSH,
-# su, sudo -i); /etc/profile.d covers login shells; the bashrc block below covers
+# agentic-update); the user's shells and the CloudCLI service point at them.
+# /etc/environment covers PAM logins (SSH, su, sudo -i); /etc/profile.d covers
+# login shells; the bashrc block below covers
 # terminals opened on the Pi's desktop.
 # For the rest of THIS script: rustup installs into /opt/rust, and its
 # cargo/rustc proxies are on PATH for the language-server step below.
@@ -1283,14 +1283,13 @@ echo ">>> Writing shared Claude Code defaults (permissions + env + plugins)..."
 # template ~/.claude/settings.json starts from, the webapp-testing skill, and
 # the shell block (used again if you re-run agentic-setup-user).
 #
-# NOTE on enabledPlugins: we DO declare it here. Earlier belief was that
-# enabledPlugins is ignored in non-interactive/container contexts — that's
-# wrong. `claude plugin install X@mkt` installs the plugin but leaves it
-# Status: disabled; the enabled-state lives in enabledPlugins in THIS file
-# (user settings, ~/.claude/settings.json), which IS honored. Without this
-# block every plugin below (including the LSP servers) stays disabled and
-# CloudCLI's /project chat shows only the 1 local skill. Enabled skills show
-# up live after the cloudcli restart — no fresh session needed.
+# enabledPlugins: `claude plugin install X@mkt` installs a plugin but leaves it
+# disabled. Whether it's on is read from enabledPlugins in the user settings
+# (~/.claude/settings.json, which this template becomes), and that is honored
+# in non-interactive runs and containers too. Without this block every plugin
+# below (the LSP servers included) stays off, and CloudCLI's /project chat
+# shows only the one local skill. Enabled skills show up after the cloudcli
+# restart at the end; no new session is needed.
 #
 # Verified keys (checked against code.claude.com/docs, 2026-10): everything
 # below is current. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS must live inside "env"
@@ -1442,10 +1441,10 @@ echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
 # user can launch it — and Chromium is downloaded once for both.
 # Playwright publishes linux-arm64 Chromium builds for Ubuntu and Debian
 # (Raspberry Pi OS reports itself as Debian). PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
-# must not be set — it would pull the wrong (x64) browser build. This whole
-# block is non-fatal: a browser-install failure must NEVER abort provisioning
-# (it previously killed everything after it — SSH, the web UI, cron —
-# because the script runs under `set -e`).
+# must not be set: it would pull the wrong (x64) browser build. This whole
+# block is non-fatal: a failed browser install must never stop provisioning,
+# which runs under `set -e` and would otherwise skip everything after it (SSH,
+# the web UI, the weekly update).
 # set +e: until the matching set -e below, a failing command doesn't stop the run.
 set +e
 unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
@@ -1641,8 +1640,8 @@ grep -qE '^[[:space:]]*Subsystem[[:space:]]+sftp' /etc/ssh/sshd_config \
 if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
   mkdir -p /etc/ssh/sshd_config.d
   cat > /etc/ssh/sshd_config.d/00-agentic.conf <<SSHD
-# Managed by the Claude Code Pi deployer. Sorts before any other drop-in, and sshd keeps the first
-# value it sees, so these win over cloud-init's defaults.
+# Managed by the Claude Code Pi deployer. Sorts before any other drop-in,
+# and sshd keeps the first value it sees, so these win over cloud-init's defaults.
 # root SSH: ${AGENTIC_ROOT_SSH:-key} (chosen at deploy; re-run the deployer to change it)
 PermitRootLogin $ROOT_LOGIN
 PasswordAuthentication yes
@@ -1702,9 +1701,10 @@ cat > /usr/local/bin/agentic-setup-user << 'ADDUSER'
 #!/usr/bin/env bash
 # agentic-setup-user [name] — set up (or repair) the box's one Claude user:
 # sudo group, their own Claude Code install, the shared settings/
-# plugins/skills, shell block, npm and git defaults. Safe to re-run: an existing
-# ~/.claude/settings.json and ~/.bashrc block are kept. Single-user by design —
-# it refuses a second user; use another Pi (or the Proxmox deployer) for another person.
+# plugins/skills, shell block, npm and git defaults. Safe to re-run: an
+# existing ~/.claude/settings.json and ~/.bashrc block are kept. Single-user
+# by design — it refuses a second user; use another Pi (or the Proxmox
+# deployer) for another person.
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
 SHARE=/usr/local/share/agentic
@@ -1796,14 +1796,14 @@ as_user bash -c 'f="$1"; [ -f "$f" ] && [ ! -L "$f" ] || exit 0
 
 echo ">>> [$u] Adding plugin marketplaces..."
 # The official marketplace is auto-registered on first INTERACTIVE launch only,
-# so a non-interactive provisioning run must add it explicitly. We use ONLY the
-# first-party marketplace now — the old 'anthropics/claude-code' demo repo
-# (registers as 'claude-code-plugins') ships same-named example copies that
-# shadow the official ones, and boxes were silently landing on those.
+# so a non-interactive provisioning run must add it explicitly. Only the
+# first-party marketplace is used: the 'anthropics/claude-code' demo repo
+# (it registers as 'claude-code-plugins') ships example plugins with the same
+# names, which would shadow the official ones.
 as_user "$CLAUDE_BIN" plugin marketplace add anthropics/claude-plugins-official \
   || echo "    [WARN] could not add claude-plugins-official"
-# Refresh the index BEFORE installing — a stale cache makes name@official
-# silently fall through, which is how boxes ended up on demo copies.
+# Refresh the index BEFORE installing: with a stale cache, name@official can
+# quietly fail to resolve.
 as_user "$CLAUDE_BIN" plugin marketplace update claude-plugins-official \
   || echo "    [WARN] could not update claude-plugins-official index"
 # Third-party marketplace for Superpowers.
@@ -2103,14 +2103,17 @@ PIN
 fi
 
 echo ">>> Installing coordinated update tooling (agentic-update / agentic-doctor / agentic-errorlog)..."
-# Single coordinated update pass, modeled on homelabhero's hh-update + hh doctor:
-# OS packages -> Rust toolchain -> the user's Claude Code -> CloudCLI
-# UI -> restart UI -> health
-# check -> log. Both tools run as root (they re-exec through sudo for the user)
-# and read the user from /etc/agentic/users.conf. Re-runnable on demand
-# ('agentic-update'), no reinstall required. Everything tracks latest
-# (unpinned); the post-update health check is the safety net, and results land
-# in /var/log/agentic-update.log.
+# Three tools, written below:
+#   agentic-errorlog  files WARN/FAIL lines in Agentic-Errors.txt (+ optional ntfy)
+#   agentic-doctor    the health check
+#   agentic-update    one coordinated update pass, in this order: OS packages ->
+#                     npm and the global dev tools (Playwright, gopls) -> Rust ->
+#                     the user's Claude Code -> the CloudCLI web UI (restarted)
+#                     -> agentic-doctor -> problems filed by agentic-errorlog.
+# Modeled on homelabhero's hh-update + hh doctor. They run as root, act on the
+# user named in /etc/agentic/users.conf, and can be run by hand at any time.
+# Everything tracks the latest release (nothing pinned); the health check at
+# the end is the safety net. The log is /var/log/agentic-update.log.
 
 cat > /usr/local/bin/agentic-errorlog << 'ERRLOG'
 #!/usr/bin/env bash
@@ -2514,7 +2517,7 @@ chmod +x /usr/local/bin/agentic-update
 # "0 4 * * 0" = 04:00 every Sunday, run as root.
 cat > /etc/cron.d/agentic-update << 'CRON'
 # Weekly coordinated update - Sunday 4:00 AM (the Pi's local time)
-# (OS incl. Claude Desktop + Rust + Claude Code + CloudCLI UI,
+# (OS incl. Claude Desktop, npm tools, Rust, Claude Code, CloudCLI UI,
 #  then a health check)
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -2533,7 +2536,6 @@ cat > /etc/logrotate.d/agentic-update << 'LOGROTATE'
 }
 LOGROTATE
 
-# Remove packages nothing depends on any more, and apt's downloaded .deb cache.
 # Start (or restart) the web UI last, now that everything it drives is ready.
 if [ -f /etc/systemd/system/cloudcli.service ]; then
   echo ">>> Starting the web UI..."
@@ -2542,6 +2544,7 @@ if [ -f /etc/systemd/system/cloudcli.service ]; then
 fi
 
 echo ">>> Cleaning up..."
+# Remove packages nothing depends on any more, and apt's downloaded .deb cache.
 apt-get autoremove -y -qq
 apt-get clean -qq
 # Unlike the LXC, the package lists stay: this is a full machine, and the
@@ -2796,19 +2799,17 @@ offer_reboot() {
   fi
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────
-# Order matters: logging starts only after the prompts, so passwords typed at
-# get_config never reach the log; everything after that is captured.
 # ── Uninstall ───────────────────────────────────────────────────────────────
-# `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh --uninstall` takes back what this script set up. It
-# asks first, shows the plan, and only starts after you type "uninstall".
-# Always removed: the web UI, the agentic-* tools, the weekly update, the
-# settings and drop-ins under /etc and /usr/local the script wrote, and its
-# shell block. Asked about: the dev toolchains, the apt software it added,
-# the memory tuning, the config.txt boot change,
-# and the Claude user's own Claude data. Never touched: the user account and
-# its password, root's password, /project, the hostname, timezone and locale,
-# the sudoers edits (their backups are in /root/*.agentic-bak), and the base
+# `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh --uninstall` takes back
+# what this script set up. It asks first, shows the plan, and only starts after
+# you type "uninstall". Always removed: the web UI, the agentic-* tools, the
+# weekly update, the settings and drop-ins under /etc and /usr/local the script
+# wrote, and its shell block; sshd_config's two edited lines go back to how
+# they were before the first deploy. Asked about: the dev toolchains, the apt
+# software it added, the memory tuning, the config.txt boot change, and the
+# Claude user's own Claude data. Never touched: the user account and its
+# password, root's password, /project, the hostname, timezone and locale, the
+# sudoers edits (their backups are in /root/*.agentic-bak), and the base
 # packages (git, curl, build tools, Python, the SSH server...) that other
 # software may rely on.
 uninstall_yes() {   # uninstall_yes "<question>" <default y|n>
@@ -3047,6 +3048,9 @@ Usage: sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh [--uninstall | --help]
 USAGE
 }
 
+# ── Main ────────────────────────────────────────────────────────────────────
+# Order matters: logging starts only after the prompts, so passwords typed at
+# get_config never reach the log; everything after that is captured.
 main() {
   [[ $# -le 1 ]] || { usage >&2; error "Give at most one option."; }
   case "${1:-}" in

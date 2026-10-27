@@ -144,7 +144,7 @@ Further hardening you can add:
 
 ## Uninstalling
 
-Everything the script installs lives inside the container, so uninstalling means deleting the container. On the Proxmox host, run `bash Claude_Code_LXC_Deployer_for_Proxmox.sh --uninstall`. It lists the containers it made, asks which one to delete, and deletes it only after you type the ID a second time. This removes /project and the Claude user's home along with everything else, so back up first (`vzdump <id>`). Existing vzdump backups and the install logs in `/var/log/agentic-deploy/` are kept.
+Everything the script installs lives inside the container, so uninstalling means deleting the container. On the Proxmox host, run `bash Claude_Code_LXC_Deployer_for_Proxmox.sh --uninstall`. It lists the containers it made, asks which one to delete, and deletes it only after you type the ID a second time. If the container has Protection turned on, the script stops first and tells you how to turn it off. This removes /project and the Claude user's home along with everything else, so back up first (`vzdump <id>`). Existing vzdump backups and the install logs in `/var/log/agentic-deploy/` are kept.
 
 ## Troubleshooting
 

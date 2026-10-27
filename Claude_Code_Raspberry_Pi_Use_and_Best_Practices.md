@@ -168,11 +168,11 @@ Further hardening you can add:
 
 ## Uninstalling
 
-Run `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh --uninstall` (or the same with the Pi 4 script). It asks its questions first, shows what it will do, and changes nothing until you type `uninstall`. Everything is logged under `/var/log/agentic-deploy/`.
+Run `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh --uninstall` (or the same with the Pi 4 script). It asks its questions first, shows what it will do, and changes nothing until you type `uninstall`. Everything is logged under `/var/log/agentic-deploy/`. Run the script with `--help` to see its options; any other option is refused, so a typo can't start an install.
 
 | Part | What happens |
 | --- | --- |
-| Web UI, the agentic-* tools, the weekly update, /etc/agentic, /usr/local/share/agentic, the root `claude` stub, the SSH and apt drop-ins, the shell block in .bashrc, the npm install-script setting | Always removed. SSH goes back to Ubuntu's defaults: root by key only, passwords allowed for everyone else |
+| Web UI, the agentic-* tools, the weekly update, /etc/agentic, /usr/local/share/agentic, the root `claude` stub, the SSH and apt drop-ins, the shell block in .bashrc, the npm install-script setting | Always removed. The two SSH lines the script edited in sshd_config go back to how they were before the first deploy (on a box deployed before this version, to the OS defaults: root by key only, passwords allowed for everyone else). If you removed the shell block's closing `cd /project` line from a .bashrc, that file is left alone and the uninstall tells you to remove the block by hand |
 | Go, Rust, gopls, rust-analyzer, the global npm tools, Playwright and its browsers | Asked; the default is yes |
 | Node.js, gh, Claude Desktop, clangd and their apt repositories | Asked; the default is no, because other software may use them |
 | The memory tuning (zram-tools swap, kernel memory settings, the rpi-swap size) | Asked; the default is yes. Applies after a reboot |

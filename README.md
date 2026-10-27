@@ -51,7 +51,7 @@ Run the same script with `--uninstall`, for example
 it removes what the script set up, asking before it removes the toolchains,
 the apt software or the Claude user's data. The user account and /project are
 always kept. The LXC version deletes the whole container after you type its
-ID a second time.
+ID a second time. `--help` lists the options; any other option is refused.
 
 ## Guides
 
