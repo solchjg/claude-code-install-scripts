@@ -150,6 +150,21 @@ resolve_template() {
 # ── Configuration ───────────────────────────────────────────────────────────
 # Asks everything up front (nothing is created until "Proceed? y"), so the rest
 # of the run is unattended. Sets the CT_* globals used by every later step.
+# Ask where the web UI (port 3001) should listen. Local is the default: the UI
+# is a full shell as the Claude user, so only open it to the LAN on purpose.
+# Asked on every run, so a re-run can switch it either way.
+ask_webui_bind() {   # $1 = what "local" means here, e.g. "this machine"
+  local ans
+  while true; do
+    read -rp "Web UI (port 3001) reachable from $1 only, or from your LAN? [local/lan, default local]: " ans
+    case "${ans,,}" in
+      ""|l|local) CT_WEBUI_BIND=127.0.0.1; return ;;
+      lan)        CT_WEBUI_BIND=0.0.0.0; return ;;
+      *)          warn "Please answer local or lan." ;;
+    esac
+  done
+}
+
 get_config() {
   # Find next available CT ID
   local next_id
@@ -173,7 +188,7 @@ get_config() {
   read_password CT_PASSWORD "Root password"
 
   # Resources. The defaults (4 cores, 10 GB RAM, 2 GB swap, 30 GB disk) leave
-  # room for Docker builds, Playwright and a few Claude sessions at once.
+  # room for Rust builds, Playwright and a few Claude sessions at once.
   read -rp "CPU cores [4]: " CT_CORES
   CT_CORES="${CT_CORES:-4}"
 
@@ -235,14 +250,14 @@ get_config() {
   fi
 
   # Unprivileged = container root is NOT host root (UIDs are shifted). This is the
-  # single biggest hardening step for an LXC that runs an auto-mode agent with
-  # Docker access. Answer N only if Docker misbehaves in the unprivileged build.
+  # single biggest hardening step for an LXC that runs an auto-mode agent.
+  # Nothing in this build needs a privileged container; keep the default.
   read -rp "Unprivileged container (recommended)? [Y/n]: " CT_UNPRIV
   [[ "$CT_UNPRIV" =~ ^[Nn] ]] && CT_UNPRIV=0 || CT_UNPRIV=1
 
   # The ONE normal (non-root) user that runs Claude Code. Required, no default.
   # One person per container: a container is cheap, and users sharing one would
-  # share docker (root-equivalent inside), sudo, /project and the web UI anyway.
+  # share sudo, /project and the web UI anyway.
   # Created if missing; gets their own Claude Code install, ~/.claude settings/
   # plugins/skills, shell and git config. The CloudCLI web UI runs as this user.
   echo ""
@@ -283,6 +298,8 @@ get_config() {
   read -rp "Give $CT_USER sudo (password required)? [Y/n]: " CT_USER_SUDO
   [[ "$CT_USER_SUDO" =~ ^[Nn] ]] && CT_USER_SUDO="no" || CT_USER_SUDO="yes"
 
+  ask_webui_bind "this container (use an SSH tunnel)"
+
   echo ""
   # Everything chosen above, for a last look: nothing on the system has changed
   # yet, and answering anything but y at "Proceed?" leaves it that way.
@@ -300,6 +317,7 @@ get_config() {
   echo "  Type:      $([[ $CT_UNPRIV -eq 1 ]] && echo unprivileged || echo 'PRIVILEGED (container root = host root)')"
   echo "  User:      $CT_USER (sudo: $CT_USER_SUDO)"
   echo "  SSH:       root + $CT_USER, password$([[ -n "$CT_SSH_KEY" ]] && echo " or key")"
+  echo "  Web UI:    port 3001, $([[ $CT_WEBUI_BIND == 0.0.0.0 ]] && echo 'open to the LAN' || echo 'local only (reach it through an SSH tunnel)')"
   echo "  Alerts:    Agentic-Errors.txt$([[ -n "$CT_NTFY_TOPIC" ]] && echo " + ntfy push to $CT_NTFY_TOPIC$([[ -n "$CT_NTFY_TOKEN" ]] && echo ' (with token)')")"
   echo "─────────────────────────────────────────────────"
   echo ""
@@ -331,9 +349,10 @@ create_container() {
     net_str+=",ip=$CT_IP,gw=$CT_GW"
   fi
 
-  # Build pct create command. nesting=1 lets Docker (and systemd services) run
-  # inside the container; keyctl=1 is needed by Docker in unprivileged mode.
-  # --start 0: we add the AppArmor line below before the first boot.
+  # Build pct create command. nesting=1 is what Proxmox recommends for current
+  # systemd in an unprivileged container (without it some systemd services fail).
+  # No Docker in this build, so no keyctl and no AppArmor exception: the
+  # container keeps Proxmox's default AppArmor profile.
   # shellcheck disable=SC2054  # the commas in --features are pct syntax, not array separators
   local cmd=(
     pct create "$CT_ID" "$TEMPLATE_PATH"
@@ -347,9 +366,8 @@ create_container() {
     --nameserver "$CT_DNS"
     --ostype ubuntu
     --unprivileged "$CT_UNPRIV"
-    --features nesting=1,keyctl=1
+    --features nesting=1
     --onboot 1
-    --start 0
   )
 
   # Add SSH key for root if provided (provisioning adds it for the user too)
@@ -359,10 +377,6 @@ create_container() {
 
   "${cmd[@]}"
   success "Container $CT_ID created."
-
-  # Disable AppArmor for Docker-in-LXC compatibility
-  info "Setting AppArmor profile to unconfined (required for Docker)..."
-  echo "lxc.apparmor.profile: unconfined" >> "/etc/pve/lxc/${CT_ID}.conf"
 }
 
 # ── Start & Wait for Network ──────────────────────────────────────────────
@@ -401,10 +415,16 @@ PROVISION_LOG=/var/log/agentic-provision.log
 exec > >(tee -a "$PROVISION_LOG") 2>&1
 exec 19>>"$PROVISION_LOG"
 BASH_XTRACEFD=19
-trap 'rc=$?; echo "!!! provisioning FAILED (exit $rc) at line $LINENO: $BASH_COMMAND — full log: $PROVISION_LOG"' ERR
+# On a failure, also delete the secret files the deployer handed over (they
+# are normally removed as soon as they've been applied).
+trap 'rc=$?; rm -f /root/agentic-provision.env /root/agentic-provision.chpasswd /root/agentic-provision.pub; echo "!!! provisioning FAILED (exit $rc) at line $LINENO: $BASH_COMMAND — full log: $PROVISION_LOG"' ERR
 set -x
+# The env file holds the ntfy topic and token, so the trace is switched off
+# while it's read: a traced `source` would copy every value into this log.
 # AGENTIC_USERS / AGENTIC_PRIMARY / AGENTIC_SUDO, pushed in by the host script
+set +x
 source /root/agentic-provision.env
+set -x
 # pct exec hands us the host's LANG (en_US.UTF-8), which doesn't exist in the
 # container until we generate it below — every perl/apt call until then spews
 # "Setting locale failed". C.UTF-8 is always built in; switch to en_US once it
@@ -541,9 +561,8 @@ apt-get install -y -qq gh || echo "    [WARN] gh install failed; install later w
 echo "    $(gh --version 2>/dev/null | head -1 || echo 'gh not installed')"
 
 echo ">>> Creating the Claude user ($AGENTIC_USERS)..."
-# Claude Code runs as this normal account, never as root. Docker group membership
-# and the Claude setup itself come later, from agentic-setup-user, once Docker
-# exists.
+# Claude Code runs as this normal account, never as root. The Claude setup
+# itself comes later, from agentic-setup-user, once the toolchains exist.
 for u in $AGENTIC_USERS; do
   if id "$u" >/dev/null 2>&1; then
     echo "    $u already exists; keeping it"
@@ -562,10 +581,12 @@ rm -f /root/agentic-provision.chpasswd
 if [ -s /root/agentic-provision.pub ]; then
   for u in $AGENTIC_USERS; do
     h="$(getent passwd "$u" | cut -d: -f6)"
-    install -d -m 700 -o "$u" -g "$u" "$h/.ssh"
-    cat /root/agentic-provision.pub >> "$h/.ssh/authorized_keys"
-    chown "$u:$u" "$h/.ssh/authorized_keys"
-    chmod 600 "$h/.ssh/authorized_keys"
+    # Written AS the user (the key comes in on stdin, since they can't read
+    # root's copy): a symlink planted in their home can't redirect a root
+    # write. sshd wants ~/.ssh 700 and authorized_keys 600.
+    runuser -u "$u" -- sh -c 'cd "$1" && install -d -m 700 .ssh && k="$(cat)" \
+      && { grep -qxF "$k" .ssh/authorized_keys 2>/dev/null || printf "%s\n" "$k" >> .ssh/authorized_keys; } \
+      && chmod 600 .ssh/authorized_keys' sh "$h" < /root/agentic-provision.pub
   done
 fi
 rm -f /root/agentic-provision.pub
@@ -581,6 +602,9 @@ EOF
 # empty). Root-only (0600) because it can hold an access token. Written when a
 # topic was given at the prompt, or as an empty template on a first install so
 # alerts can be turned on later; a re-run that skipped the prompt keeps it.
+# The trace is off for this block too (it would print the topic and token),
+# and the values are dropped from the environment right after.
+set +x
 if [ -n "${AGENTIC_NTFY_TOPIC:-}" ] || [ ! -f /etc/agentic/ntfy.conf ]; then
   ( umask 077; cat > /etc/agentic/ntfy.conf << EOF
 # ntfy push alerts. agentic-errorlog sends one short push whenever agentic-update
@@ -599,6 +623,8 @@ NTFY_TOKEN=$(printf '%q' "${AGENTIC_NTFY_TOKEN:-}")
 EOF
   )
 fi
+unset AGENTIC_NTFY_TOPIC AGENTIC_NTFY_SERVER AGENTIC_NTFY_TOKEN
+set -x
 rm -f /root/agentic-provision.env
 
 echo ">>> Setting up the shared toolchain environment..."
@@ -672,14 +698,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-mod
 chmod -R a+rX /opt/rust
 echo "    Rust $(rustc --version | awk '{print $2}')"
 
-echo ">>> Installing Docker..."
-curl -fsSL https://get.docker.com | sh
-systemctl enable docker
-echo "    Docker $(docker --version | awk '{print $3}' | tr -d ',')"
-
-echo ">>> Installing Docker Compose plugin..."
-apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
-echo "    Compose $(docker compose version --short 2>/dev/null || echo 'included with Docker')"
+# No Docker in this container, by design: Claude and everything it builds run
+# natively as the one user, and the container itself is the isolation. Without
+# Docker the user has no root-equivalent group, so sudo's password really is
+# the only way to root. Services a project needs (PostgreSQL, Redis, ...) are
+# installed with apt and run as normal systemd services.
 
 echo ">>> Writing shared Claude Code defaults (permissions + env + plugins)..."
 # Claude Code itself is installed for the user (by agentic-setup-user, below) —
@@ -719,7 +742,8 @@ mkdir -p /usr/local/share/agentic/skills
 #   defaultMode is honored from USER settings (~/.claude/settings.json) — it is
 #   silently ignored if set in a project .claude/settings.json. Running as a
 #   normal user also means anything the classifier lets through is bounded by
-#   that user's own permissions (plus docker/sudo, if granted).
+#   that user's own permissions (plus sudo, if granted — which asks for a
+#   password Claude can't type).
 #   The "deny" list applies in EVERY mode (including auto) and is evaluated
 #   before the classifier — it's the hard floor for credentials/secrets.
 # Deny-rule syntax (permissions docs):
@@ -834,7 +858,7 @@ echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
 # is closed), so the old PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 hack
 # is gone and must not be set — it would pull the wrong browser build. This whole
 # block is non-fatal: a browser-install failure must NEVER abort provisioning
-# (it previously killed everything after it — Docker services, SSH, cron —
+# (it previously killed everything after it — SSH, the web UI, cron —
 # because the script runs under `set -e`).
 # set +e: until the matching set -e below, a failing command doesn't stop the run.
 set +e
@@ -842,20 +866,32 @@ unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
 pip install --break-system-packages --root-user-action=ignore -q playwright \
   && echo "    python playwright package installed" \
   || echo "    [WARN] pip install playwright failed (webapp-testing skill will error on import)"
-if python3 -m playwright install --with-deps chromium; then
-  echo "    Playwright chromium + OS deps installed"
-elif python3 -m playwright install chromium; then
-  echo "    Playwright chromium installed (browser only; some OS deps may be missing)"
+# The browser cache belongs to the Claude user, so the browser download runs
+# AS the user (root never writes into a folder the user controls); only
+# the OS libraries Chromium needs (install-deps, via apt) run as root.
+install -d -m 755 -o "$AGENTIC_PRIMARY" -g "$AGENTIC_PRIMARY" /opt/ms-playwright
+python3 -m playwright install-deps chromium \
+  || echo "    [WARN] some of Chromium's OS libraries didn't install (browser tests may fail)"
+if (cd / && runuser -u "$AGENTIC_PRIMARY" -- env HOME="$(getent passwd "$AGENTIC_PRIMARY" | cut -d: -f6)" \
+      PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install chromium); then
+  echo "    Playwright chromium installed in /opt/ms-playwright"
 else
-  echo "    [WARN] Playwright browser install failed. Retry later with:"
-  echo "      sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install --with-deps chromium"
+  echo "    [WARN] Playwright browser install failed. Retry later as $AGENTIC_PRIMARY with:"
+  echo "      PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install chromium"
 fi
 set -e
 
 echo ">>> Setting up /project directory..."
 # The Claude user's workspace, owned by them (not root) so Claude can work here.
+# /project belongs to the user, so root never writes into it directly (a
+# symlink planted there would redirect the write): CLAUDE.md is built in a
+# root-private temp file, filled in, then installed by the user.
 mkdir -p /project
-cat > /project/CLAUDE.md << 'CLAUDEMD'
+[ ! -L /project ] || { echo "!!! /project is a symlink; refusing to write through it"; exit 1; }
+chown "$AGENTIC_PRIMARY:$AGENTIC_PRIMARY" /project
+chmod 755 /project
+CLAUDEMD_TMP="$(mktemp)"
+cat > "$CLAUDEMD_TMP" << 'CLAUDEMD'
 # Claude Code Workspace
 
 ## Environment
@@ -872,8 +908,9 @@ cat > /project/CLAUDE.md << 'CLAUDEMD'
   in /opt/rust; your crates go to ~/.cargo), go install (~/go/bin)
 - **System packages**: `sudo apt install ...` — run by YOU (if given sudo at deploy);
   Claude is denied sudo/su and should ask you to run admin commands
-- **Docker**: Docker Engine + Compose plugin, running and ready; your user is in the
-  `docker` group, so no sudo needed
+- **No Docker**: there are no containers inside this container — everything runs
+  natively as __PRIMARY__. Need a database server? Ask the user to `sudo apt install
+  postgresql` (or redis-server) and use it as a normal systemd service
 - **Web UI**: CloudCLI UI (claudecodeui) on port 3001 — chat, file explorer/editor, git, shell
   (runs as __PRIMARY__)
 - **GitHub CLI**: `gh` (sign in once with `gh auth login`; used for PRs and issues)
@@ -908,13 +945,6 @@ headless server. To connect every session automatically, use `/config` →
 API keys don't work), and the first use asks a one-time y/n confirmation, so do
 it from an interactive shell.
 
-## Docker Usage
-Docker compose files should go in /docker/<service-name>/docker-compose.yml.
-There is no always-on Watchtower daemon. Container images are refreshed one-shot
-by the weekly `agentic-update` run (or on demand: `sudo agentic-update`), so give
-containers you want updated the usual `restart: unless-stopped`.
-All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
-
 ## Conventions
 - Prefer creating files over printing long code blocks
 - Use git for version control on all projects in /project/src/
@@ -945,10 +975,13 @@ to confirm what's active.
 - **webapp-testing** (local skill, not a marketplace plugin): Playwright-based
   browser testing for UI verification and debugging
 CLAUDEMD
-sed -i -e "s/__USERS__/${AGENTIC_USERS}/" -e "s/__PRIMARY__/${AGENTIC_PRIMARY}/" /project/CLAUDE.md
+sed -i -e "s/__USERS__/${AGENTIC_USERS}/" -e "s/__PRIMARY__/${AGENTIC_PRIMARY}/" "$CLAUDEMD_TMP"
+chmod 644 "$CLAUDEMD_TMP"
+(cd / && runuser -u "$AGENTIC_PRIMARY" -- install -m 644 "$CLAUDEMD_TMP" /project/CLAUDE.md)
+rm -f "$CLAUDEMD_TMP"
+# Hand back anything under /project an older run created as root (chown -R
+# never follows symlinks).
 chown -R "$AGENTIC_PRIMARY:$AGENTIC_PRIMARY" /project
-chmod 755 /project
-chmod 644 /project/CLAUDE.md
 
 echo ">>> Configuring SSH..."
 # Ubuntu's sshd_config Includes /etc/ssh/sshd_config.d/*.conf from the TOP of the
@@ -1004,8 +1037,6 @@ alias ..="cd .."
 alias ...="cd ../.."
 alias gs="git status"
 alias gl="git log --oneline -20"
-alias dc="docker compose"
-alias dps="docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 
 # Always start in /project
 cd /project 2>/dev/null || true
@@ -1030,7 +1061,7 @@ echo ">>> Installing agentic-setup-user (Claude Code setup for the user)..."
 cat > /usr/local/bin/agentic-setup-user << 'ADDUSER'
 #!/usr/bin/env bash
 # agentic-setup-user [name] — set up (or repair) the box's one Claude user:
-# docker(/sudo) groups, their own Claude Code install, the shared settings/
+# sudo group, their own Claude Code install, the shared settings/
 # plugins/skills, shell block, npm and git defaults. Safe to re-run: an existing
 # ~/.claude/settings.json and ~/.bashrc block are kept. Single-user by design —
 # it refuses a second user; deploy another container for another person.
@@ -1057,8 +1088,6 @@ if ! id "$u" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$u"
   echo ">>> [$u] created user (set a password with: sudo passwd $u)"
 fi
-# docker group = docker without sudo (root-equivalent inside this container).
-if getent group docker >/dev/null; then usermod -aG docker "$u"; fi
 if [ "$AGENTIC_SUDO" = yes ]; then usermod -aG sudo "$u"; fi
 h="$(getent passwd "$u" | cut -d: -f6)"
 
@@ -1086,14 +1115,18 @@ CLAUDE_BIN="$h/.local/bin/claude"
 [ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$h/.claude/bin/claude"
 echo "    Claude Code installed: $(as_user "$CLAUDE_BIN" --version 2>/dev/null || echo 'version unknown')"
 
+# Everything in the user's home is written AS the user (as_user), never by
+# root: a symlink the user (or an agent running as them) planted there would
+# otherwise redirect a root write — ~/.claude -> /etc would hand them /etc.
+# The chown -R first takes back anything an older version created as root;
+# it never follows symlinks.
 # ~/.claude is private (it holds the login). The shared settings template is
 # copied only when the user has no settings.json yet, so yours is never
 # overwritten by a re-run.
-install -d -m 700 -o "$u" -g "$u" "$h/.claude"
-install -d -o "$u" -g "$u" "$h/.claude/skills"
-if [ ! -e "$h/.claude/settings.json" ]; then
-  install -m 644 -o "$u" -g "$u" "$SHARE/claude-settings.json" "$h/.claude/settings.json"
-fi
+if [ -e "$h/.claude" ]; then chown -R "$u:$u" "$h/.claude"; fi
+as_user install -d -m 700 "$h/.claude"
+as_user install -d "$h/.claude/skills"
+as_user sh -c '[ -e "$1" ] || install -m 644 "$2" "$1"' sh "$h/.claude/settings.json" "$SHARE/claude-settings.json"
 
 echo ">>> [$u] Adding plugin marketplaces..."
 # The official marketplace is auto-registered on first INTERACTIVE launch only,
@@ -1162,12 +1195,10 @@ as_user "$CLAUDE_BIN" plugin list 2>/dev/null || echo "    (plugin list unavaila
 # The webapp-testing skill (copied once), the shell block (appended once; its
 # header line is the marker that prevents duplicates) and git defaults.
 echo ">>> [$u] Skills, shell and git defaults..."
-if [ -d "$SHARE/skills/webapp-testing" ] && [ ! -e "$h/.claude/skills/webapp-testing" ]; then
-  cp -r "$SHARE/skills/webapp-testing" "$h/.claude/skills/webapp-testing"
+if [ -d "$SHARE/skills/webapp-testing" ]; then
+  as_user sh -c '[ -e "$1" ] || cp -r "$2" "$1"' sh "$h/.claude/skills/webapp-testing" "$SHARE/skills/webapp-testing"
 fi
-grep -q '── Claude Code Container ──' "$h/.bashrc" 2>/dev/null \
-  || cat "$SHARE/bashrc" >> "$h/.bashrc"
-chown -R "$u:$u" "$h/.claude" "$h/.bashrc"
+as_user sh -c 'grep -q "$1" "$2" 2>/dev/null || cat "$3" >> "$2"' sh '── Claude Code Container ──' "$h/.bashrc" "$SHARE/bashrc"
 as_user git config --global init.defaultBranch main
 as_user git config --global core.editor nano
 as_user git config --global pull.rebase false
@@ -1210,12 +1241,8 @@ PRIMARY_HOME="$(getent passwd "$AGENTIC_PRIMARY" | cut -d: -f6)"
 PRIMARY_CLAUDE="$PRIMARY_HOME/.local/bin/claude"
 [ -x "$PRIMARY_CLAUDE" ] || PRIMARY_CLAUDE="$PRIMARY_HOME/.claude/bin/claude"
 
-echo ">>> Docker ready (no always-on service containers)..."
-# code-server was removed — CloudCLI UI (below) already provides a file
-# explorer/editor, so it was redundant (and dropped its :8443 + hardcoded
-# 'admin' password surface). Watchtower is no longer a scheduled daemon; image
-# updates for any containers YOU create now run one-shot from the coordinated
-# 'agentic-update' script (see below).
+# code-server is not installed — CloudCLI UI (below) already provides a file
+# explorer/editor.
 
 echo ">>> Installing CloudCLI UI (claudecodeui web front end)..."
 # Web front end for Claude Code: chat UI, file explorer/editor, git panel, and a
@@ -1238,7 +1265,7 @@ if [ -d "$CCUI_PKG/node_modules/better-sqlite3" ] && ! ls "$CCUI_PKG/node_module
   ( cd "$CCUI_PKG" && npm rebuild >/dev/null 2>&1 ) || echo "    [WARN] CloudCLI native rebuild failed"
 fi
 CCUI_BIN="$(command -v cloudcli || echo /usr/bin/cloudcli)"
-install -d -m 700 -o "$AGENTIC_PRIMARY" -g "$AGENTIC_PRIMARY" "$PRIMARY_HOME/.cloudcli"
+(cd / && runuser -u "$AGENTIC_PRIMARY" -- install -d -m 700 "$PRIMARY_HOME/.cloudcli")
 echo "    CloudCLI UI installed: $("$CCUI_BIN" version 2>/dev/null || echo 'version unknown')"
 
 # Browser feature runtime. CloudCLI detects Playwright via require('playwright')
@@ -1250,9 +1277,11 @@ echo "    CloudCLI UI installed: $("$CCUI_BIN" version 2>/dev/null || echo 'vers
 echo ">>> Installing Playwright runtime for CloudCLI Browser feature..."
 npm install -g "${NPM_QUIET[@]}" playwright \
   || echo "    [WARN] global Playwright install failed (CloudCLI Browser feature won't work)"
-ls -d /opt/ms-playwright/chromium-* >/dev/null 2>&1 \
-  || playwright install chromium \
-  || echo "    [WARN] Chromium download failed; retry later with: sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install chromium"
+# The build this Playwright version wants (a no-op when it's already there),
+# downloaded as the user who owns the browser cache.
+(cd / && runuser -u "$AGENTIC_PRIMARY" -- env HOME="$PRIMARY_HOME" PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin playwright install chromium) \
+  || echo "    [WARN] Chromium download failed; retry later as $AGENTIC_PRIMARY with: PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install chromium"
 # Browser cache owned by the Claude user, so their own Playwright (a pip --user
 # or project install wanting a different browser build) can add to it.
 if [ -d /opt/ms-playwright ]; then
@@ -1264,7 +1293,7 @@ fi
 cat > /etc/systemd/system/cloudcli.service << EOF
 [Unit]
 Description=CloudCLI UI (claudecodeui) - web front end for Claude Code
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -1277,9 +1306,10 @@ Environment=NODE_ENV=production
 # succeed.
 Environment=NPM_CONFIG_INCLUDE=dev
 Environment=HOME=${PRIMARY_HOME}
-# Listen on every interface (LAN access) on :3001; drive this user's claude
-# and keep the web UI's own login database in their home.
-Environment=HOST=0.0.0.0
+# Listen on :3001, on localhost only (reach it through an SSH tunnel) unless
+# LAN access was chosen at deploy; drive this user's claude and keep the web
+# UI's own login database in their home.
+Environment=HOST=${AGENTIC_WEBUI_BIND:-127.0.0.1}
 Environment=SERVER_PORT=3001
 Environment=CLAUDE_CLI_PATH=${PRIMARY_CLAUDE}
 Environment=DATABASE_PATH=${PRIMARY_HOME}/.cloudcli/auth.db
@@ -1295,16 +1325,15 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# Load the new unit, start it at every boot, and start it now.
+# Load the new unit and start it at every boot. It's started at the very end,
+# once the user's Claude setup, tools and permissions are all in place.
 systemctl daemon-reload
 systemctl enable cloudcli >/dev/null 2>&1 || true
-systemctl start cloudcli \
-  || echo "    [WARN] cloudcli service failed to start; check 'journalctl -u cloudcli'"
 
 echo ">>> Installing coordinated update tooling (agentic-update / agentic-doctor / agentic-errorlog)..."
 # Single coordinated update pass, modeled on homelabhero's hh-update + hh doctor:
 # OS packages -> Rust toolchain -> the user's Claude Code -> CloudCLI
-# UI -> one-shot Watchtower for any Docker containers -> restart UI -> health
+# UI -> restart UI -> health
 # check -> log. Both tools run as root (they re-exec through sudo for the user)
 # and read the user from /etc/agentic/users.conf. Re-runnable on demand
 # ('agentic-update'), no container recreation required. Everything tracks latest
@@ -1480,7 +1509,10 @@ for u in $AGENTIC_USERS; do
   check "$u: claude binary present"       "test -x '$cb'"
   check "$u: claude reports a version"    "(cd '$h' && runuser -u '$u' -- env -i HOME='$h' PATH=/usr/local/bin:/usr/bin:/bin '$cb' --version)"
   check "$u: settings.json is valid JSON" "python3 -m json.tool '$h/.claude/settings.json'"
-  check "$u: in docker group"             "id -nG '$u' | grep -qw docker"
+  # sudo -l -U lists every rule that applies to the user (their own, group
+  # rules like %sudo, any file); NOPASSWD or !authenticate there means an
+  # auto-mode agent could become root without the password.
+  note  "$u: sudo asks for a password (no NOPASSWD rule)" "! sudo -l -U '$u' 2>/dev/null | grep -qE 'NOPASSWD|!authenticate'"
   note  "$u: claude logged in (creds on disk; run 'claude' /login as $u if WARN)" "test -s '$h/.claude/.credentials.json'"
 done
 # Shared toolchains and services.
@@ -1489,7 +1521,6 @@ check "GitHub CLI (gh) present"     "command -v gh"
 check "cloudcli service active"     "systemctl is-active --quiet cloudcli"
 check "cloudcli runs as ${AGENTIC_PRIMARY:-<primary>}" "[ \"\$(systemctl show -p User --value cloudcli)\" = '$AGENTIC_PRIMARY' ]"
 check "UI listening on :3001"       "ss -ltn | grep -q ':3001'"
-check "docker daemon running"       "systemctl is-active --quiet docker"
 # Parse df once; an unreadable df is a "can't tell", not a failed box.
 DISK_PCT=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc 0-9)
 if [ -n "$DISK_PCT" ]; then
@@ -1535,25 +1566,69 @@ exec >>"$LOG" 2>&1
 echo "==================================================================="
 echo ">>> agentic-update starting: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 
-echo ">>> [1/7] OS packages (includes Node.js patches within its LTS line)..."
+echo ">>> [1/6] OS packages (includes Node.js patches within its LTS line and gh)..."
 apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get clean -qq \
   || echo "    [WARN] OS package update failed"
 
-echo ">>> [2/7] npm (latest)..."
+echo ">>> [2/6] npm + global dev tools (incl. Playwright) + gopls..."
 npm install -g --no-fund --no-audit --loglevel=error npm@latest || echo "    [WARN] npm self-update failed"
 # npm 12+ blocks dependencies' install scripts behind an allowlist (separate
 # from ignore-scripts), so CloudCLI's native deps (better-sqlite3/node-pty/
-# bcrypt) never compile -> cloudcli crash-loops and nothing binds :3001. Boxes
-# deploy on npm 10 (builds fine) but this weekly run upgrades npm above, so the
-# config MUST be set here -- AFTER npm@latest lands (it only persists to
-# /root/.npmrc under npm 12+) and BEFORE the cloudcli reinstall/rebuild below.
+# bcrypt) never compile -> cloudcli crash-loops and nothing binds :3001. This
+# weekly run can move npm up a major version above, so the config is set again
+# here -- AFTER npm@latest lands (it only persists to /root/.npmrc under npm
+# 12+) and BEFORE the cloudcli reinstall/rebuild below.
 # The user gets it too: CloudCLI's in-app plugin installs run as them.
 npm config set dangerously-allow-all-scripts true 2>/dev/null || true
 for u in $AGENTIC_USERS; do
   as_user "$u" npm config set dangerously-allow-all-scripts true >/dev/null 2>&1 || true
 done
+# The global dev tools and npm-based language servers the deployer installed
+# (re-running the deployer skips them, so they're kept current here). Only the
+# ones still installed are touched; CloudCLI has its own step below.
+# Builds a <pkg>@latest list of the tools that are still installed, so one
+# npm call updates them all; a tool you uninstalled is not brought back.
+NPM_TOOLS=()
+for pkg in typescript ts-node eslint prettier typescript-language-server pyright playwright; do
+  npm ls -g --depth=0 "$pkg" >/dev/null 2>&1 && NPM_TOOLS+=("${pkg}@latest")
+done
+if [ ${#NPM_TOOLS[@]} -gt 0 ]; then
+  npm install -g --no-fund --no-audit --loglevel=error "${NPM_TOOLS[@]}" \
+    && echo "    updated: ${NPM_TOOLS[*]}" \
+    || echo "    [WARN] global dev tool update failed"
+fi
+# Playwright: the pip package follows the npm one to its latest release, then
+# the Chromium build each one wants is fetched. That download runs as whoever
+# owns the browser cache (the Claude user), so root never writes into a folder
+# the user controls.
+if python3 -c 'import playwright' >/dev/null 2>&1; then
+  pip install -U -q --break-system-packages --root-user-action=ignore playwright \
+    || echo "    [WARN] pip playwright update failed"
+fi
+PW_OWNER="$(stat -c %U /opt/ms-playwright 2>/dev/null || echo root)"
+pw_chromium() {  # pw_chromium <playwright command...>: fetch the Chromium it wants
+  if [ "$PW_OWNER" = root ]; then
+    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright "$@" install chromium
+  else
+    as_user "$PW_OWNER" env PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright "$@" install chromium
+  fi
+}
+if [ -d /opt/ms-playwright ]; then
+  if command -v playwright >/dev/null 2>&1; then
+    pw_chromium playwright >/dev/null || echo "    [WARN] Chromium download for the npm Playwright failed"
+  fi
+  if python3 -c 'import playwright' >/dev/null 2>&1; then
+    pw_chromium python3 -m playwright >/dev/null || echo "    [WARN] Chromium download for the Python Playwright failed"
+  fi
+fi
+# gopls, the Go language server behind the gopls-lsp plugin (only when the
+# deployer installed it).
+if [ -x /usr/local/bin/gopls ] && [ -x /usr/local/go/bin/go ]; then
+  GOBIN=/usr/local/bin /usr/local/go/bin/go install golang.org/x/tools/gopls@latest \
+    && echo "    gopls updated" || echo "    [WARN] gopls update failed"
+fi
 
-echo ">>> [3/7] Rust (shared toolchain in /opt/rust)..."
+echo ">>> [3/6] Rust (shared toolchain in /opt/rust)..."
 # CARGO_HOME is set for this one call so rustup updates the shared proxies in
 # /opt/rust/cargo; users keep their own ~/.cargo.
 if [ -x /opt/rust/cargo/bin/rustup ]; then
@@ -1564,7 +1639,7 @@ else
   echo "    (no shared rustup; skipped)"
 fi
 
-echo ">>> [4/7] Claude Code (the user's own install)..."
+echo ">>> [4/6] Claude Code (the user's own install)..."
 # `claude update` is the documented manual update path for a native install
 # (DISABLE_AUTOUPDATER only stops the background check; `update` still works and
 # honors the autoUpdatesChannel / minimumVersion settings). Fall back to
@@ -1578,7 +1653,7 @@ for u in $AGENTIC_USERS; do
   echo "    $u: Claude Code $(as_user "$u" claude --version 2>/dev/null || echo 'version unknown')"
 done
 
-echo ">>> [5/7] CloudCLI UI (claudecodeui)..."
+echo ">>> [5/6] CloudCLI UI (claudecodeui)..."
 npm install -g --no-fund --no-audit --loglevel=error @cloudcli-ai/cloudcli@latest || echo "    [WARN] CloudCLI UI update failed"
 # Self-heal: if the native build was skipped (better-sqlite3 binding missing),
 # rebuild in place before restart -- else cloudcli loops on "Could not locate
@@ -1590,19 +1665,9 @@ if [ -d "$CCUI_PKG/node_modules/better-sqlite3" ] && ! ls "$CCUI_PKG/node_module
 fi
 systemctl restart cloudcli || echo "    [WARN] cloudcli restart failed"
 
-echo ">>> [6/7] Docker images (one-shot Watchtower)..."
-# Watchtower, run once and then removed (--rm): pulls newer images for the
-# running containers, recreates them with the same settings, and deletes the
-# old images (--cleanup).
-if command -v docker >/dev/null 2>&1 && [ -n "$(docker ps -q 2>/dev/null)" ]; then
-  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-    containrrr/watchtower --run-once --cleanup \
-    || echo "    [WARN] Watchtower one-shot run failed"
-else
-  echo "    (no running containers; skipped)"
-fi
-
-echo ">>> [7/7] Health check..."
+echo ">>> [6/6] Health check..."
+# AGENTIC_NO_ERRORLOG=1 keeps agentic-doctor from filing its own entry: its
+# WARN/FAIL lines land in this log and are filed below with everything else.
 if AGENTIC_NO_ERRORLOG=1 agentic-doctor; then
   echo ">>> agentic-update finished OK: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 else
@@ -1626,7 +1691,7 @@ chmod +x /usr/local/bin/agentic-update
 # "0 4 * * 0" = 04:00 every Sunday, run as root.
 cat > /etc/cron.d/agentic-update << 'CRON'
 # Weekly coordinated update - Sunday 4:00 AM ET
-# (OS + Rust + Claude Code + CloudCLI UI + container images,
+# (OS + npm tools + Rust + Claude Code + CloudCLI UI,
 #  then a health check)
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -1646,6 +1711,13 @@ cat > /etc/logrotate.d/agentic-update << 'LOGROTATE'
 LOGROTATE
 
 # Remove packages nothing depends on any more, and apt's downloaded .deb cache.
+# Start (or restart) the web UI last, now that everything it drives is ready.
+if [ -f /etc/systemd/system/cloudcli.service ]; then
+  echo ">>> Starting the web UI..."
+  systemctl restart cloudcli \
+    || echo "    [WARN] cloudcli service failed to start; check 'journalctl -u cloudcli'"
+fi
+
 echo ">>> Cleaning up..."
 apt-get autoremove -y -qq
 apt-get clean -qq
@@ -1672,6 +1744,7 @@ PROVISION_EOF
       printf 'AGENTIC_NTFY_TOPIC=%q\n' "$CT_NTFY_TOPIC"
       printf 'AGENTIC_NTFY_SERVER=%q\n' "$CT_NTFY_SERVER"
       printf 'AGENTIC_NTFY_TOKEN=%q\n' "$CT_NTFY_TOKEN"
+      printf 'AGENTIC_WEBUI_BIND=%q\n' "$CT_WEBUI_BIND"
     } > /tmp/provision-${CT_ID}.env
     for u in "${CT_USERS[@]}"; do
       printf '%s:%s\n' "$u" "${CT_USER_PASSWORDS[$u]}"
@@ -1708,7 +1781,7 @@ write_notes() {
   notes=$(cat <<'EOF'
 # 🤖 Claude Code Container
 
-**Web UI (CloudCLI UI):** http://__IP__:3001 — _create a login on first visit_
+__WEBUI_LINE__
 **SSH:** `ssh __USER__@__IP__`   |   **Console:** `pct enter __CTID__` (root; `su - __USER__`)
 
 ## Start Claude Code
@@ -1716,7 +1789,7 @@ Claude runs as **__USER__** only — never root (`claude` refuses to run as root
 Log in as __USER__, then run `claude` (the shell auto-cd's to `/project`).
 
 ## Update & health
-- `sudo agentic-update` — one coordinated pass: OS → Rust → Claude Code → Web UI → container images → health check
+- `sudo agentic-update` — one coordinated pass: OS → npm tools → Rust → Claude Code → Web UI → health check
 - `sudo agentic-doctor` — run the health check on its own
 - Auto-runs weekly (Sunday 4 AM ET). Log: `/var/log/agentic-update.log`
 - Any WARN/FAIL from either is also appended to `Agentic-Errors.txt` on __USER__'s home folder; delete it once dealt with
@@ -1733,6 +1806,14 @@ _IP above is the address at deploy time; on DHCP it may change (check with `pct 
 EOF
 )
   # Fill in the placeholders.
+  # Web UI line: a direct link if it's open to the LAN, else the SSH tunnel.
+  local webline
+  if [[ "$CT_WEBUI_BIND" == 0.0.0.0 ]]; then
+    webline="**Web UI (CloudCLI UI):** http://__IP__:3001 (open to the LAN) — _create a login on first visit_"
+  else
+    webline="**Web UI (CloudCLI UI):** container only. From your computer: \`ssh -L 3001:localhost:3001 __USER__@__IP__\`, then open http://localhost:3001 — _create a login on first visit_"
+  fi
+  notes=${notes//__WEBUI_LINE__/$webline}
   notes=${notes//__IP__/$ct_ip}
   notes=${notes//__CTID__/$CT_ID}
   notes=${notes//__USER__/$CT_PRIMARY_USER}
@@ -1766,7 +1847,11 @@ print_summary() {
   echo -e "  ${BOLD}Connect:${NC}"
   echo -e "    Console: ${CYAN}pct enter $CT_ID${NC}"
   [[ -n "${ct_ip:-}" ]] && echo -e "    SSH:     ${CYAN}ssh ${CT_USER}@${ct_ip}${NC}"
-  [[ -n "${ct_ip:-}" ]] && echo -e "    Web UI:  ${CYAN}http://${ct_ip}:3001${NC} (as $CT_USER — ${YELLOW}create its login NOW${NC}; the first visitor claims it)"
+  if [[ -n "${ct_ip:-}" ]] && [[ "$CT_WEBUI_BIND" == 0.0.0.0 ]]; then
+    echo -e "    Web UI:  ${CYAN}http://${ct_ip}:3001${NC} (as $CT_USER — ${YELLOW}create its login NOW${NC}; the first visitor claims it)"
+  elif [[ -n "${ct_ip:-}" ]]; then
+    echo -e "    Web UI:  ${CYAN}ssh -L 3001:localhost:3001 ${CT_USER}@${ct_ip}${NC}, then ${CYAN}http://localhost:3001${NC} (local only — ${YELLOW}create its login NOW${NC})"
+  fi
   echo ""
   echo -e "  ${BOLD}Start Claude Code:${NC} (as a normal user, not root)"
   echo -e "    ${CYAN}claude${NC}  (shell auto-cd's to /project on login; from the console: ${CYAN}su - $CT_USER${NC})"
@@ -1776,7 +1861,7 @@ print_summary() {
   echo -e "  ${BOLD}Installed:${NC}"
   echo "    • Claude Code (native)      • Node.js (latest LTS)"
   echo "    • Python 3 + pip + venv     • Go (latest)"
-  echo "    • Rust (system, /opt/rust)  • Docker + Compose"
+  echo "    • Rust (system, /opt/rust)  • No Docker (all native)"
   echo "    • Git + GitHub CLI (gh)     • Build essentials
     • ripgrep, fzf, fd"
   echo "    • PostgreSQL & Redis CLI    • CloudCLI UI web front end (port 3001)"

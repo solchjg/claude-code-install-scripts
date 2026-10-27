@@ -1,6 +1,6 @@
 # Claude Code on Lubuntu: Use and Best Practices
 
-Oct 26, 2026 · Joe Solch
+Oct 27, 2026 · Joe Solch
 
 ## What you get
 
@@ -48,7 +48,7 @@ To check from inside the VM after the install, run `sudo agentic-doctor`. The "h
 
 Do these right after the script finishes, in this order; step 1 matters most.
 
-1. **Claim the web UI.** Open `http://<ip>:3001` and create its login. Until you do, anyone who can reach port 3001 can create it.
+1. **Claim the web UI.** It listens only on this machine unless you chose LAN at deploy. From your PC, run `ssh -L 3001:localhost:3001 <user>@<ip>` and open `http://localhost:3001` (with LAN access, open `http://<ip>:3001` instead). Create its login straight away: until you do, anyone who can reach it can create it.
 2. **Log out and back in, or reboot.** The script offers a reboot at the end. The `kvm` group that Cowork needs only applies to new logins.
 3. **Sign in to Claude Desktop.** Log in to the desktop as your user, open **Claude** from the menu (or run `claude-desktop`) and sign in. Try the Cowork tab; if it reports a missing requirement, run `sudo agentic-doctor`.
 4. **Sign in to Claude Code.** In a terminal, run `claude` and follow `/login`. A claude.ai subscription also enables Remote Control.
@@ -64,7 +64,7 @@ Log in as your user, `cd` into a project under /project, and run `claude` there.
 - **Start a project:** `mkdir -p /project/src/myapp && cd $_ && git init`, then `claude`.
 - **Resume:** `claude --continue` picks up the last session in that folder; `claude --resume` lets you choose one.
 - **Claude Desktop:** the Code tab works on /project directly; Cowork handles longer agentic tasks in its own VM, which the app starts and stops by itself. Don't start, stop or edit its QEMU processes yourself.
-- **Web UI:** `http://<ip>:3001` gives chat, a file editor, git and a shell, all running as your user. Use it on your LAN only.
+- **Web UI:** chat, a file editor, git and a shell, all running as your user. By default it's reachable only through an SSH tunnel: `ssh -L 3001:localhost:3001 <user>@<ip>`, then `http://localhost:3001`. Re-run the deploy script and answer `lan` to open it on `http://<ip>:3001`. To open it to your LAN later, change `HOST=127.0.0.1` to `HOST=0.0.0.0` in /etc/systemd/system/cloudcli.service, then run `sudo systemctl daemon-reload && sudo systemctl restart cloudcli`.
 - **From another PC:** Claude Desktop on your own computer can open an SSH session to this machine (`ssh-copy-id <user>@<ip>` first; Desktop can't type passwords).
 - **From your phone:** in a session, type `/rc` (Remote Control), then continue from the Claude app or claude.ai/code.
 - **No Docker:** there are no containers here. If a project needs a database server, run `sudo apt install postgresql` (or `redis-server`) yourself and use it as a normal service.
@@ -80,8 +80,8 @@ When an update or health check hits a WARN or FAIL, an entry is appended to `Age
 
 | Task | Command | Notes |
 | --- | --- | --- |
-| Update everything now | `sudo agentic-update` | OS (incl. Claude Desktop and QEMU), Rust, Claude Code and web UI, then a health check |
-| Health check | `sudo agentic-doctor` | Exit 0 means healthy; includes Cowork's KVM, QEMU and vsock checks |
+| Update everything now | `sudo agentic-update` | OS (incl. Claude Desktop and QEMU), npm and the global dev tools (including Playwright and gopls), Rust, Claude Code and the web UI, then a health check |
+| Health check | `sudo agentic-doctor` | Exit 0 means healthy; includes Cowork's KVM, QEMU and vsock checks, and warns if sudo stops asking for a password |
 | Check for problems | `cat ~/Desktop/Agentic-Errors.txt` | Only exists after a WARN or FAIL; delete it when dealt with |
 | Test phone alerts | `sudo agentic-errorlog --test-ntfy` | Only if ntfy is set up; see the next section |
 | Read the update log | `less /var/log/agentic-update.log` | Rotated monthly |
@@ -133,17 +133,17 @@ There's no container around Claude here, so the user account is the boundary. Cl
 | --- | --- | --- |
 | Claude user | Normal account; root is blocked from running `claude` | Limits what an agent mistake touches |
 | Passwords | The user's password must differ from root's | A leaked user password doesn't become root |
-| sudo | Optional, and always asks for a password (a NOPASSWD rule is offered for removal) | Admin work stays with you; Claude can't type the password |
+| sudo | Optional, and asks for a password. The script checks every sudoers file for a NOPASSWD rule that covers the user (directly, through ALL, or through a group such as `sudo`) and offers to remove it; `agentic-doctor` warns if one comes back | Admin work stays with you; Claude can't type the password |
 | Claude permissions | Auto mode, plus deny rules for secrets, `dd`, `mkfs`, `rm -rf /`, `sudo` and `su` | Claude can't read credentials or escalate on its own |
 | Cowork | Runs tasks in its own QEMU/KVM VM; the user is in the `kvm` group | The VM is the app's sandbox; `kvm` grants VM access, not root |
 | SSH | Root and the user log in with a password or key; at most 4 tries per connection | Convenient; keep port 22 on your LAN |
-| Web UI | Runs as the user; own login | Plain HTTP on port 3001: LAN only, or put it behind a TLS reverse proxy |
+| Web UI | Runs as the user; own login; listens on the machine only unless you chose LAN at deploy, and starts only after setup is finished | Plain HTTP on port 3001: use an SSH tunnel, or keep LAN access to a trusted network or behind a TLS reverse proxy |
 | Phone alerts | Off unless you set an ntfy topic; settings file is root-only | A guessable topic would let others read your alerts |
 | Updates | Weekly, with health check | Keeps OS, Claude Desktop and Claude Code patched |
 
 Further hardening you can add:
 
-- Turn on the firewall (`sudo ufw allow from <your-lan> to any port 22,3001 proto tcp`, then `sudo ufw enable`), or the Proxmox firewall for a VM.
+- Turn on the firewall (`sudo ufw allow from <your-lan> to any port 22 proto tcp`, plus port 3001 if you chose LAN access for the web UI, then `sudo ufw enable`), or the Proxmox firewall for a VM.
 - Use SSH keys, and set PasswordAuthentication no in /etc/ssh/sshd_config.d/00-agentic.conf once they work.
 - If you never need root over SSH, set PermitRootLogin no in that same file.
 
@@ -161,6 +161,7 @@ Start with Agentic-Errors.txt on your desktop if it exists, then `sudo agentic-d
 | Claude Desktop forgets your sign-in | The desktop keyring is locked or missing: `sudo apt install gnome-keyring libpam-gnome-keyring`, then log out and in. If you changed your password in the script, the keyring may ask for the old one once. |
 | `claude: not run as root` | Expected. Use `su - <user>`, then `claude`. |
 | `claude: command not found` as the user | Run `sudo agentic-setup-user`. |
-| Web UI not on :3001 | `journalctl -u cloudcli -n 50`, then `sudo agentic-update` (it rebuilds native modules). |
+| Web UI won't open | It's local only unless you chose LAN: use the SSH tunnel above. If the tunnel doesn't work either, check `journalctl -u cloudcli -n 50`, then `sudo agentic-update` (it rebuilds native modules). |
+| Doctor: "sudo asks for a password" WARN | A NOPASSWD rule (or `Defaults !authenticate`) lets the user use sudo without a password, which an auto-mode agent could use. `sudo -l -U <user>` shows it; remove it with `sudo visudo` or by editing the file in /etc/sudoers.d/, or re-run the deploy script and say yes when it offers to. |
 | `sudo` asks for a password Claude can't give | Expected. Run the command yourself. |
 | No ntfy push arrives | Run `sudo agentic-errorlog --test-ntfy`; it names the failure. Check the topic matches the one in the app, and the token if your server needs one. |
