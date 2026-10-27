@@ -67,6 +67,8 @@
 #   /project/CLAUDE.md           what Claude is told about this box
 #   /etc/agentic/README.md       the notes card (copy: ~USER/CLAUDE-PI.md)
 #   /etc/sysctl.d/90-agentic-pi4.conf   zram-friendly kernel memory settings
+#   /etc/agentic/os-packages-kept  OS packages kept from autoremove on the first
+#                                run (marked manual; see the provision script)
 #   Agentic-Errors.txt           WARN/FAIL lines from agentic-update/-doctor, on
 #                                the user's desktop (home folder if none)
 #   /var/log/agentic-deploy/, /var/log/agentic-provision.log,
@@ -537,6 +539,26 @@ if [ "$APT_WAITED" -eq 0 ]; then echo "    no apt/dpkg lock held; continuing"; f
 cat > /etc/apt/apt.conf.d/99agentic-lock-wait << 'APTLOCK'
 DPkg::Lock::Timeout "600";
 APTLOCK
+
+# Raspberry Pi OS images ship some packages marked "automatically installed"
+# that nothing depends on any more (libfuse2t64, which AppImages need, the
+# menu editor alacarte, chromium-sandbox, ...). The autoremove at the end of
+# this script, and the weekly one in agentic-update, would delete them, which
+# is not what anyone asked for. So on the first run, before we install or
+# remove anything, mark whatever is already autoremovable as manually
+# installed. Autoremove then only takes what this script itself leaves
+# orphaned. The marker file keeps later runs from doing it again.
+if [ ! -f /etc/agentic/os-packages-kept ]; then
+  # Simulate (-s) an autoremove; each "Remv <pkg> [...]" line is one package.
+  OS_LEFTOVERS="$(apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print $2}')"
+  if [ -n "$OS_LEFTOVERS" ]; then
+    # shellcheck disable=SC2086
+    apt-mark manual $OS_LEFTOVERS >/dev/null 2>&1 || true
+    echo "    keeping the OS's own unused packages (not auto-removed): $(echo $OS_LEFTOVERS | wc -w)"
+  fi
+  mkdir -p /etc/agentic
+  printf '%s\n' $OS_LEFTOVERS > /etc/agentic/os-packages-kept
+fi
 
 echo ">>> Setting timezone to $AGENTIC_TZ..."
 # Chosen at the prompt (defaults to what Raspberry Pi Imager already set, or

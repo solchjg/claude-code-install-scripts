@@ -69,6 +69,8 @@
 #                                summary, the notes card and agentic-doctor)
 #   /etc/sysctl.d/90-agentic-memory.conf     4gb profile kernel memory settings
 #   /etc/rpi/swap.conf.d/90-agentic-memory.conf   4gb profile: rpi-swap's zram size
+#   /etc/agentic/os-packages-kept  OS packages kept from autoremove on the first
+#                                run (marked manual; see the provision script)
 #   Agentic-Errors.txt           WARN/FAIL lines from agentic-update/-doctor, on
 #                                the user's desktop (home folder if none)
 #   /var/log/agentic-deploy/, /var/log/agentic-provision.log,
@@ -552,7 +554,7 @@ export LANG=C.UTF-8
 unset LC_ALL LANGUAGE
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-echo ">>> Waiting for Ubuntu's first-boot apt jobs to finish..."
+echo ">>> Waiting for first-boot apt jobs to finish..."
 # A freshly flashed Pi kicks off apt-daily / unattended-upgrades (and cloud-init
 # on Ubuntu) right after the first boot, and they hold the apt/dpkg locks — our first
 # apt-get then dies with "Could not get lock /var/lib/apt/lists/lock". Pause the
@@ -601,6 +603,26 @@ if [ "$APT_WAITED" -eq 0 ]; then echo "    no apt/dpkg lock held; continuing"; f
 cat > /etc/apt/apt.conf.d/99agentic-lock-wait << 'APTLOCK'
 DPkg::Lock::Timeout "600";
 APTLOCK
+
+# Raspberry Pi OS images ship some packages marked "automatically installed"
+# that nothing depends on any more (libfuse2t64, which AppImages need, the
+# menu editor alacarte, chromium-sandbox, ...). The autoremove at the end of
+# this script, and the weekly one in agentic-update, would delete them, which
+# is not what anyone asked for. So on the first run, before we install or
+# remove anything, mark whatever is already autoremovable as manually
+# installed. Autoremove then only takes what this script itself leaves
+# orphaned. The marker file keeps later runs from doing it again.
+if [ ! -f /etc/agentic/os-packages-kept ]; then
+  # Simulate (-s) an autoremove; each "Remv <pkg> [...]" line is one package.
+  OS_LEFTOVERS="$(apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print $2}')"
+  if [ -n "$OS_LEFTOVERS" ]; then
+    # shellcheck disable=SC2086
+    apt-mark manual $OS_LEFTOVERS >/dev/null 2>&1 || true
+    echo "    keeping the OS's own unused packages (not auto-removed): $(echo $OS_LEFTOVERS | wc -w)"
+  fi
+  mkdir -p /etc/agentic
+  printf '%s\n' $OS_LEFTOVERS > /etc/agentic/os-packages-kept
+fi
 
 echo ">>> Setting timezone to $AGENTIC_TZ..."
 # Chosen at the prompt (defaults to what Raspberry Pi Imager already set, or
