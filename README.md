@@ -1,6 +1,6 @@
 # Claude Code Install Scripts
 
-Note: Thanks to the original serversathome developer for the script https://github.com/serversathome/claudelxc.
+Note: Thanks to the original serversathome developer for the script https://github.com/serversathome/claudelxc that was used as a basis for developing these scripts.
 
 Deployer scripts that turn a machine into a fully provisioned Claude Code
 development box, run as one normal (non-root) user, plus a use and
