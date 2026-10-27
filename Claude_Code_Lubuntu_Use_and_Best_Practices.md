@@ -148,6 +148,20 @@ Further hardening you can add:
 - Use SSH keys, and set PasswordAuthentication no in /etc/ssh/sshd_config.d/00-agentic.conf once they work.
 - If you never need root over SSH, set PermitRootLogin no in that same file. (Re-running the script resets it to your key-only or password choice.)
 
+## Uninstalling
+
+Run `sudo bash Claude_Code_Lubuntu_Deployer.sh --uninstall`. It asks its questions first, shows what it will do, and changes nothing until you type `uninstall`. Everything is logged under `/var/log/agentic-deploy/`.
+
+| Part | What happens |
+| --- | --- |
+| Web UI, the agentic-* tools, the weekly update, /etc/agentic, /usr/local/share/agentic, the root `claude` stub, the SSH and apt drop-ins, the shell block in .bashrc, the npm install-script setting | Always removed. SSH goes back to Ubuntu's defaults: root by key only, passwords allowed for everyone else |
+| Go, Rust, gopls, rust-analyzer, the global npm tools, Playwright and its browsers | Asked; the default is yes |
+| Node.js, gh, Claude Desktop, clangd, Cowork's QEMU/KVM stack and their apt repositories | Asked; the default is no, because other software may use them |
+| The Claude user's Claude data (~/.claude, the claude install, ~/.cloudcli, the notes card, Agentic-Errors.txt) | Asked; the default is no. Deleting it signs Claude out and removes its settings, plugins and history |
+| The user account, /project, root's password, hostname, timezone, the SSH server, base packages, group memberships and the sudoers edits | Kept. The sudoers backups stay in `/root/*.agentic-bak` |
+
+Log out and back in afterwards, so your shells drop the old PATH and settings.
+
 ## Troubleshooting
 
 Start with Agentic-Errors.txt on your desktop if it exists, then `sudo agentic-doctor`; each FAIL line names the part to look at. The comment block at the top of the deploy script has a "Where things live" list of every file it writes, and comments through the script explain each step.

@@ -166,6 +166,22 @@ Further hardening you can add:
 - Use SSH keys, and set PasswordAuthentication no in /etc/ssh/sshd_config.d/00-agentic.conf once they work.
 - If you never need root over SSH, set PermitRootLogin no in that same file. (Re-running the script resets it to your key-only or password choice.)
 
+## Uninstalling
+
+Run `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh --uninstall` (or the same with the Pi 4 script). It asks its questions first, shows what it will do, and changes nothing until you type `uninstall`. Everything is logged under `/var/log/agentic-deploy/`.
+
+| Part | What happens |
+| --- | --- |
+| Web UI, the agentic-* tools, the weekly update, /etc/agentic, /usr/local/share/agentic, the root `claude` stub, the SSH and apt drop-ins, the shell block in .bashrc, the npm install-script setting | Always removed. SSH goes back to Ubuntu's defaults: root by key only, passwords allowed for everyone else |
+| Go, Rust, gopls, rust-analyzer, the global npm tools, Playwright and its browsers | Asked; the default is yes |
+| Node.js, gh, Claude Desktop, clangd and their apt repositories | Asked; the default is no, because other software may use them |
+| The memory tuning (zram-tools swap, kernel memory settings, the rpi-swap size) | Asked; the default is yes. Applies after a reboot |
+| The config.txt change (Pi 4 `arm_boost`, Pi 5 4K-page kernel) | Asked when present; the default is yes. config.txt is backed up first, and the change applies after a reboot |
+| The Claude user's Claude data (~/.claude, the claude install, ~/.cloudcli, the notes card, Agentic-Errors.txt) | Asked; the default is no. Deleting it signs Claude out and removes its settings, plugins and history |
+| The user account, /project, root's password, hostname, timezone, the SSH server, base packages, group memberships and the sudoers edits | Kept. The sudoers backups stay in `/root/*.agentic-bak` |
+
+Log out and back in afterwards, so your shells drop the old PATH and settings.
+
 ## Troubleshooting
 
 Start with Agentic-Errors.txt on your desktop if it exists, then `sudo agentic-doctor`; each FAIL line names the part to look at.

@@ -43,6 +43,9 @@
 #      and offer the reboot the boot tweaks need (4K kernel, and on the 4gb
 #      profile the larger zram from Raspberry Pi OS's rpi-swap).
 #
+# Uninstall: sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh --uninstall
+#   (asks what to remove first; see uninstall() near the bottom).
+#
 # Safe to re-run: existing users, settings and shell blocks are kept, and the
 # installers skip what's already there — on a failure, fix the cause and run
 # it again (there's no container to throw away on a Pi).
@@ -2776,7 +2779,207 @@ offer_reboot() {
 # ── Main ──────────────────────────────────────────────────────────────────
 # Order matters: logging starts only after the prompts, so passwords typed at
 # get_config never reach the log; everything after that is captured.
+# ── Uninstall ───────────────────────────────────────────────────────────────
+# `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh --uninstall` takes back what this script set up. It
+# asks first, shows the plan, and only starts after you type "uninstall".
+# Always removed: the web UI, the agentic-* tools, the weekly update, the
+# settings and drop-ins under /etc and /usr/local the script wrote, and its
+# shell block. Asked about: the dev toolchains, the apt software it added,
+# the memory tuning, the config.txt boot change,
+# and the Claude user's own Claude data. Never touched: the user account and
+# its password, root's password, /project, the hostname, timezone and locale,
+# the sudoers edits (their backups are in /root/*.agentic-bak), and the base
+# packages (git, curl, build tools, Python, the SSH server...) that other
+# software may rely on.
+uninstall_yes() {   # uninstall_yes "<question>" <default y|n>
+  local ans
+  if [[ "$2" == y ]]; then read -rp "$1 [Y/n]: " ans; [[ ! "$ans" =~ ^[Nn] ]]
+  else read -rp "$1 [y/N]: " ans; [[ "$ans" =~ ^[Yy] ]]; fi
+}
+
+uninstall() {
+  [[ $(id -u) -eq 0 ]] || error "Run the uninstall as root: sudo bash $0 --uninstall"
+  # shellcheck disable=SC2034  # AGENTIC_PRIMARY is set by users.conf; local keeps it here
+  local AGENTIC_USERS="" AGENTIC_PRIMARY="" u h ans
+  # shellcheck disable=SC1091
+  [[ -r /etc/agentic/users.conf ]] && source /etc/agentic/users.conf
+  if [[ -z "$AGENTIC_USERS" ]]; then
+    warn "/etc/agentic/users.conf is missing, so the Claude user isn't known."
+    read -rp "Claude user to clean up (Enter for none): " AGENTIC_USERS
+    AGENTIC_USERS="${AGENTIC_USERS// /}"
+    [[ -z "$AGENTIC_USERS" ]] || id "$AGENTIC_USERS" >/dev/null 2>&1 || error "No such user: $AGENTIC_USERS"
+  fi
+  echo ""
+  echo -e "${BOLD}Uninstall${NC}: removes what this script set up${AGENTIC_USERS:+ for $AGENTIC_USERS}."
+  echo "Always removed: the web UI (CloudCLI), agentic-update/-doctor/-setup-user/-errorlog,"
+  echo "the weekly update, /etc/agentic, /usr/local/share/agentic, the root 'claude' stub, the"
+  echo "SSH and apt drop-ins, the shell block in .bashrc and the npm install-script setting."
+  echo ""
+  local RM_TOOLS=no RM_APT=no RM_DATA=no RM_MEM=no RM_BOOT=no
+  uninstall_yes "Remove the dev toolchains it installed (Go, Rust, gopls, rust-analyzer, the global npm tools, Playwright and its browsers)?" y && RM_TOOLS=yes
+  uninstall_yes "Remove the apt software it added (Node.js and the NodeSource repo, gh and its repo, Claude Desktop and its repo, clangd)? Other software you installed may use them." n && RM_APT=yes
+  if [[ -n "$(ls /etc/sysctl.d/90-agentic-*.conf /etc/rpi/swap.conf.d/90-agentic-memory.conf 2>/dev/null)" ]] \
+     || grep -qs 'Managed by the Claude Code Pi deployer' /etc/default/zramswap; then
+    uninstall_yes "Undo the memory tuning (the script's zram swap and kernel memory settings)? Swap goes back to the OS's own after a reboot." y && RM_MEM=yes
+  fi
+  if grep -qsE '^# Claude Code Pi( 4)? deployer: ' /boot/firmware/config.txt /boot/config.txt; then
+    uninstall_yes "Undo its config.txt change (the 4K-page kernel line under [pi5])? Takes effect at the next reboot." y && RM_BOOT=yes
+  fi
+  if [[ -n "$AGENTIC_USERS" ]]; then
+    uninstall_yes "Delete $AGENTIC_USERS's Claude Code data (~/.claude, ~/.claude.json, the claude install, ~/.cloudcli, the notes card, Agentic-Errors.txt)? This signs Claude out and deletes its settings, plugins and history." n && RM_DATA=yes
+  fi
+  echo ""
+  echo "Kept: the user account, /project, root's password, hostname/timezone/locale, the"
+  echo "SSH server, base packages, group memberships (sudo/kvm) and the sudoers edits."
+  read -rp "Type 'uninstall' to go ahead (anything else cancels): " ans
+  [[ "$ans" == uninstall ]] || { info "Cancelled; nothing was changed."; exit 0; }
+
+  mkdir -p /var/log/agentic-deploy
+  local log
+  log="/var/log/agentic-deploy/uninstall-$(date +%Y%m%d-%H%M%S).log"
+  ( umask 077; : > "$log" )
+  exec > >(tee -a "$log") 2>&1
+  info "Logging the uninstall to $log"
+
+  # Runs a command as the Claude user, from /, so nothing in their home is
+  # touched by root (the same reason the installer writes there as them).
+  as_claude_user() { (cd / && runuser -u "$u" -- "$@"); }
+
+  echo ">>> Web UI and weekly update..."
+  systemctl disable --now cloudcli >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/cloudcli.service
+  systemctl daemon-reload || true
+  command -v npm >/dev/null 2>&1 && { npm uninstall -g --no-fund --no-audit --loglevel=error @cloudcli-ai/cloudcli || true; }
+  rm -f /etc/cron.d/agentic-update /etc/logrotate.d/agentic-update
+
+  echo ">>> Tools, settings and drop-ins..."
+  rm -f /usr/local/bin/agentic-setup-user /usr/local/bin/agentic-update \
+        /usr/local/bin/agentic-doctor /usr/local/bin/agentic-errorlog
+  # The root 'claude' stub, only if it's ours (it points root at the user).
+  if grep -qs 'not run as root on this box' /usr/local/bin/claude; then rm -f /usr/local/bin/claude; fi
+  rm -rf /usr/local/share/agentic /etc/agentic
+  rm -f /etc/profile.d/agentic.sh /etc/apt/apt.conf.d/99agentic-lock-wait /etc/apt/preferences.d/agentic-no-cowork-vm /etc/profile.d/agentic-memory.sh
+  [[ -f /etc/environment ]] && sed -i -E '/^RUSTUP_HOME=\/opt\/rust\/rustup$/d; /^PLAYWRIGHT_BROWSERS_PATH=\/opt\/ms-playwright$/d; /^(CARGO_BUILD_JOBS|MAKEFLAGS|GOFLAGS|npm_config_jobs|NODE_OPTIONS)=/d' /etc/environment
+  git config --system --unset-all safe.directory '^/project(/\*)?$' 2>/dev/null || true
+  # npm's install-script allowlist (root's; the user's is below).
+  command -v npm >/dev/null 2>&1 && { npm config delete allow-scripts 2>/dev/null || true; }
+  # SSH: drop our drop-in and put the main file's two lines back to Ubuntu's
+  # commented defaults (root by key only, passwords on for everyone else).
+  # Never restart into a config sshd rejects.
+  rm -f /etc/ssh/sshd_config.d/00-agentic.conf
+  if [[ -f /etc/ssh/sshd_config ]]; then
+    sed -i -e 's/^PermitRootLogin .*/#PermitRootLogin prohibit-password/' \
+           -e 's/^PasswordAuthentication .*/#PasswordAuthentication yes/' /etc/ssh/sshd_config
+  fi
+  if [[ ! -f /etc/ssh/sshd_config ]]; then
+    :
+  elif sshd -t 2>/dev/null || /usr/sbin/sshd -t 2>/dev/null; then
+    systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  else
+    warn "sshd's config test failed after the change; check /etc/ssh/sshd_config before the next restart"
+  fi
+  # The shell block, from root's .bashrc and (as them) the user's: from its
+  # marker line to its last line, only when both are there.
+  local uninstall_bashrc_awk='index($0, m) { skip=1; next } skip && $0 == "cd /project 2>/dev/null || true" { skip=0; next } !skip'
+  if grep -qs "── Claude Code Pi ──" /root/.bashrc; then
+    awk -v m="── Claude Code Pi ──" "$uninstall_bashrc_awk" /root/.bashrc > /root/.bashrc.agentic-new && mv /root/.bashrc.agentic-new /root/.bashrc
+  fi
+  for u in $AGENTIC_USERS; do
+    id "$u" >/dev/null 2>&1 || continue
+    h="$(getent passwd "$u" | cut -d: -f6)"
+    as_claude_user bash -c 'f="$1/.bashrc"; [ -f "$f" ] && [ ! -L "$f" ] && grep -q "$2" "$f" || exit 0
+      awk -v m="$2" "$3" "$f" > "$f.agentic-new" && cat "$f.agentic-new" > "$f"; rm -f "$f.agentic-new"' \
+      sh "$h" "── Claude Code Pi ──" "$uninstall_bashrc_awk" || true
+    as_claude_user npm config delete allow-scripts >/dev/null 2>&1 || true
+  done
+
+  if [[ "$RM_MEM" == yes ]]; then
+    echo ">>> Memory tuning..."
+    rm -f /etc/sysctl.d/90-agentic-pi4.conf /etc/sysctl.d/90-agentic-memory.conf \
+          /etc/rpi/swap.conf.d/90-agentic-memory.conf
+    # zram-tools only when this script installed and configured it.
+    if grep -qs 'Managed by the Claude Code Pi deployer' /etc/default/zramswap; then
+      systemctl disable --now zramswap >/dev/null 2>&1 || true
+      apt-get purge -y -qq zram-tools || true
+      rm -f /etc/default/zramswap
+    fi
+  fi
+  if [[ "$RM_BOOT" == yes ]]; then
+    echo ">>> config.txt..."
+    local cfg
+    for cfg in /boot/firmware/config.txt /boot/config.txt; do
+      grep -qsE '^# Claude Code Pi( 4)? deployer: ' "$cfg" || continue
+      # The block is the marker comment plus three lines ([piN], the setting,
+      # [all]); backed up first, rewritten in place (it's on the FAT boot partition).
+      cp -a "$cfg" "$cfg.agentic-uninstall-bak"
+      awk '/^# Claude Code Pi( 4)? deployer: /{skip=4} skip>0{skip--; next} {print}' "$cfg" > "$cfg.agentic-new" \
+        && cat "$cfg.agentic-new" > "$cfg"
+      rm -f "$cfg.agentic-new"
+      echo "    removed the deployer's block from $cfg (backup: $cfg.agentic-uninstall-bak)"
+    done
+  fi
+
+  if [[ "$RM_TOOLS" == yes ]]; then
+    echo ">>> Dev toolchains..."
+    if command -v npm >/dev/null 2>&1; then
+      npm uninstall -g --no-fund --no-audit --loglevel=error \
+        typescript ts-node eslint prettier typescript-language-server pyright playwright || true
+    fi
+    pip uninstall -y -q --break-system-packages --root-user-action=ignore playwright 2>/dev/null || true
+    rm -rf /opt/ms-playwright /usr/local/go /opt/rust
+    rm -f /etc/profile.d/go.sh /usr/local/bin/gopls
+    # rust-analyzer: only our symlink into the shared toolchain.
+    if [[ -L /usr/local/bin/rust-analyzer ]]; then rm -f /usr/local/bin/rust-analyzer; fi
+  fi
+
+  if [[ "$RM_APT" == yes ]]; then
+    echo ">>> apt software and repositories..."
+    local pkgs=() p
+    # The global npm tools can't run without Node, so they go first.
+    if command -v npm >/dev/null 2>&1; then
+      npm uninstall -g --no-fund --no-audit --loglevel=error \
+        typescript ts-node eslint prettier typescript-language-server pyright playwright || true
+    fi
+    for p in claude-desktop gh nodejs clangd; do
+      dpkg -s "$p" >/dev/null 2>&1 && pkgs+=("$p")
+    done
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+      apt-get purge -y -qq "${pkgs[@]}" || warn "some packages didn't uninstall: ${pkgs[*]}"
+    fi
+    rm -f /etc/apt/sources.list.d/claude-desktop.list /etc/apt/sources.list.d/github-cli.list \
+          /etc/apt/sources.list.d/nodesource.* /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+          /etc/apt/keyrings/nodesource.gpg /usr/share/keyrings/claude-desktop-archive-keyring.asc \
+          /etc/apt/preferences.d/nodejs /etc/apt/preferences.d/nsolid
+    apt-get update -qq || true
+    apt-get autoremove -y -qq || true
+  fi
+
+  if [[ "$RM_DATA" == yes ]]; then
+    echo ">>> The Claude user's Claude data..."
+    for u in $AGENTIC_USERS; do
+      id "$u" >/dev/null 2>&1 || continue
+      h="$(getent passwd "$u" | cut -d: -f6)"
+      as_claude_user bash -c 'cd "$1" || exit 0
+        rm -rf .claude .claude.json .claude.json.backup .cloudcli .local/share/claude .local/bin/claude \
+               "$2" Agentic-Errors.txt Desktop/Agentic-Errors.txt' sh "$h" "CLAUDE-PI.md" || true
+    done
+  fi
+
+  echo ""
+  success "Uninstall finished. Log: $log"
+  echo "  Left in place: the user account, /project, the SSH server, base packages and group memberships."
+  ls /root/*.agentic-bak >/dev/null 2>&1 \
+    && echo "  sudoers backups from the NOPASSWD fix: $(ls /root/*.agentic-bak | tr '\n' ' ')(copy one back with visudo -cf first if you want the old rule)"
+  [[ "$RM_TOOLS" == yes ]] || echo "  Toolchains kept: /usr/local/go, /opt/rust, /opt/ms-playwright and the global npm tools."
+  echo "  Open shells still have the old PATH and settings; log out and back in. Reboot to put swap, memory and boot settings back."
+}
+
 main() {
+  if [[ "${1:-}" == --uninstall ]]; then
+    header
+    uninstall
+    exit 0
+  fi
   header
   preflight
   get_config

@@ -142,6 +142,10 @@ Further hardening you can add:
 - Use SSH keys, and set PasswordAuthentication no in /etc/ssh/sshd_config.d/00-agentic.conf once they work.
 - If you answered N to unprivileged, rebuild as unprivileged; nothing in this setup needs a privileged container.
 
+## Uninstalling
+
+Everything the script installs lives inside the container, so uninstalling means deleting the container. On the Proxmox host, run `bash Claude_Code_LXC_Deployer_for_Proxmox.sh --uninstall`. It lists the containers it made, asks which one to delete, and deletes it only after you type the ID a second time. This removes /project and the Claude user's home along with everything else, so back up first (`vzdump <id>`). Existing vzdump backups and the install logs in `/var/log/agentic-deploy/` are kept.
+
 ## Troubleshooting
 
 Start with `~/Agentic-Errors.txt` if it exists, then `sudo agentic-doctor`; each FAIL line names the part to look at. The comment block at the top of the deploy script has a "Where things live" list of every file it writes, and comments through the script explain each step.

@@ -8,6 +8,7 @@
 #   curl -fsSLO https://raw.githubusercontent.com/solchjg/claude-code-install-scripts/main/Claude_Code_LXC_Deployer_for_Proxmox.sh
 #   less Claude_Code_LXC_Deployer_for_Proxmox.sh
 #   bash Claude_Code_LXC_Deployer_for_Proxmox.sh
+# To remove a container it made: bash Claude_Code_LXC_Deployer_for_Proxmox.sh --uninstall
 #
 # GitHub: https://github.com/solchjg/claude-code-install-scripts
 # Based on the original by serversathome: https://github.com/serversathome/claudelxc
@@ -2010,7 +2011,48 @@ print_summary() {
 # ── Main ──────────────────────────────────────────────────────────────────
 # Order matters: logging starts only after the prompts, so passwords typed at
 # get_config never reach the log; everything after that is captured.
+# ── Uninstall ───────────────────────────────────────────────────────────────
+# `bash Claude_Code_LXC_Deployer_for_Proxmox.sh --uninstall` on the Proxmox
+# host. Everything this script installs lives inside its container, so
+# uninstalling means deleting that container: it lists the containers whose
+# Notes carry this script's card, asks which one, and destroys it only after
+# you type its ID a second time. vzdump backups and the host's install logs
+# (/var/log/agentic-deploy/) are kept.
+uninstall() {
+  preflight
+  local id ids="" again name
+  echo -e "${BOLD}Containers made by this script${NC} (their Notes start with the Claude Code card):"
+  for id in $(pct list 2>/dev/null | awk 'NR>1{print $1}'); do
+    if pct config "$id" 2>/dev/null | grep -q 'Claude Code Container'; then
+      ids+=" $id"
+      echo "  $id  $(pct config "$id" | awk '/^hostname:/{print $2}')  ($(pct status "$id" | awk '{print $2}'))"
+    fi
+  done
+  [[ -n "$ids" ]] || echo "  (none found; you can still give an ID)"
+  read -rp "Container ID to delete (Enter to cancel): " id
+  [[ -n "$id" ]] || { info "Cancelled; nothing was changed."; exit 0; }
+  [[ "$id" =~ ^[0-9]+$ ]] && pct status "$id" >/dev/null 2>&1 || error "No container with ID $id."
+  name="$(pct config "$id" | awk '/^hostname:/{print $2}')"
+  if [[ " $ids " != *" $id "* ]]; then
+    warn "Container $id ($name) doesn't carry this script's notes card. Make sure it's the right one."
+  fi
+  warn "This permanently deletes container $id ($name): /project, the Claude user's home and"
+  warn "Claude's login and history inside it, plus its snapshots. Back up anything you need first"
+  warn "(vzdump $id). Existing vzdump backups are kept."
+  read -rp "Type the container ID again to delete it: " again
+  [[ "$again" == "$id" ]] || { info "Cancelled; nothing was changed."; exit 0; }
+  pct stop "$id" >/dev/null 2>&1 || true
+  # --purge also drops it from backup jobs, replication and HA.
+  pct destroy "$id" --purge
+  success "Container $id ($name) deleted. Install logs are still in /var/log/agentic-deploy/."
+}
+
 main() {
+  if [[ "${1:-}" == --uninstall ]]; then
+    header
+    uninstall
+    exit 0
+  fi
   header
   preflight
   get_config

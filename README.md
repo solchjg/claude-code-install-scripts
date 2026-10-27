@@ -44,6 +44,15 @@ The web UI (CloudCLI, port 3001) listens on the machine itself unless you
 answer `lan` at deploy. Reach it from your PC with
 `ssh -L 3001:localhost:3001 <user>@<ip>` and open `http://localhost:3001`.
 
+## Uninstalling
+
+Run the same script with `--uninstall`, for example
+`sudo bash Claude_Code_Lubuntu_Deployer.sh --uninstall`. On Lubuntu and the Pis
+it removes what the script set up, asking before it removes the toolchains,
+the apt software or the Claude user's data. The user account and /project are
+always kept. The LXC version deletes the whole container after you type its
+ID a second time.
+
 ## Guides
 
 Each guide comes as Markdown and as a PDF with the same content.
