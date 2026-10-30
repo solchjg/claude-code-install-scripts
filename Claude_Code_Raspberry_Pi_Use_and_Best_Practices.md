@@ -1,6 +1,6 @@
 # Claude Code on Raspberry Pi: Use and Best Practices
 
-Oct 26, 2026 · Joe Solch
+Oct 27, 2026 · Joe Solch
 
 ## What you get
 
@@ -15,7 +15,7 @@ One Raspberry Pi per person, with Claude Code running as one normal user and nev
 | Node.js, Python, Go, language servers | /usr, /usr/local | root |
 | Rust toolchain | /opt/rust (your crates in ~/.cargo) | root |
 | GitHub CLI (`gh`) | /usr/bin/gh, from GitHub's apt repository | root; you sign in as the user |
-| Playwright browsers | /opt/ms-playwright | the user |
+| Playwright browsers | /opt/ms-playwright | root; everyone can read them |
 | Web UI (CloudCLI) | port 3001, service `cloudcli`; optional on the Pi 5 | runs as the user |
 | Update and health tools | `agentic-update`, `agentic-doctor`, `agentic-setup-user`, `agentic-errorlog` | root (run with sudo) |
 | Problem log | Agentic-Errors.txt on the user's desktop, only when something fails | the user |
@@ -34,7 +34,7 @@ The comment block at the top of each script has a "Where things live" list of ev
 4. **Create your own account** in Raspberry Pi Imager or the first-boot wizard. That account is the natural choice for the Claude user, because it's the one the desktop logs in as.
 5. **Run the script** from a terminal on the Pi: `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh` (or the Pi 4 one). It asks all its questions first and changes nothing until you answer "Proceed? y".
 
-The script asks for the hostname, timezone, root password, the Claude user, optional ntfy alerts and whether to install Claude Desktop. The Pi 5 script also asks for the memory profile, the web UI and the 4K-page kernel; the Pi 4 script asks about its boot tuning instead. Both are safe to run again: existing users, settings and shell blocks are kept and installed parts are skipped.
+The script asks for the hostname, timezone, root password, whether root may use SSH with a key only (the default) or with its password too, the Claude user, optional ntfy alerts, whether to install Claude Desktop, and whether the web UI is reachable from the Pi only (the default) or from your LAN. The Pi 5 script also asks for the memory profile, the web UI and the 4K-page kernel; the Pi 4 script asks about its boot tuning instead. Both are safe to run again: existing users, settings and shell blocks are kept and installed parts are skipped.
 
 ## Pi 5 memory profiles (4gb and 8gb)
 
@@ -54,14 +54,14 @@ The build-job and heap limits live in `/etc/agentic/memory.env`. They're applied
 
 **Changing profile.** Run the script again and pick the other profile. Going from 4gb to 8gb removes the 4gb settings. On a re-run the script also notices an installed web UI and asks whether to keep it; the default follows the profile, so on 4gb pressing Enter removes it. Removing it stops and deletes the service and uninstalls the package, but keeps its login database (~/.cloudcli), so turning it back on later keeps your account.
 
-**Pi 4.** The Pi 4 script has no profiles. It targets 8 GB, uses zram at 50% of RAM (or the OS's own), swappiness 100 and 2 cargo jobs, because the Pi 4's slower cores gain little from more. The web UI is always installed.
+**Pi 4.** The Pi 4 script has no profiles. It targets 8 GB, uses zram at 50% of RAM (or the OS's own), swappiness 100 and 2 cargo jobs (set in /etc/environment, so Claude Desktop and the web UI get it too), because the Pi 4's slower cores gain little from more. The web UI is always installed.
 
 ## First steps after deploy
 
 Do these right after the script finishes, in this order.
 
 1. **Reboot.** The script offers a reboot at the end. It's needed for the 4K-page kernel (Pi 5), the larger zram (Pi 5, 4gb), the Pi 4 boot tuning, and kernel updates.
-2. **Claim the web UI, if installed.** Open `http://<ip>:3001` and create its login. Until you do, anyone who can reach port 3001 can create it.
+2. **Claim the web UI, if installed.** It listens only on the Pi unless you chose LAN at deploy. From your PC, run `ssh -L 3001:localhost:3001 <user>@<ip>` and open `http://localhost:3001` (with LAN access, open `http://<ip>:3001` instead). Create its login straight away: until you do, anyone who can reach it can create it.
 3. **Sign in to Claude Desktop.** Log in to the desktop as your user, open **Claude** from the menu (or run `claude-desktop`) and sign in. Chat and Code work; Computer Use and dictation aren't available on Linux yet.
 4. **Sign in to Claude Code.** In a terminal, run `claude` and follow `/login`. A claude.ai subscription also enables Remote Control.
 5. **Check health.** Run `sudo agentic-doctor`. The expected WARN is "logged in", and only before step 4. Any WARN or FAIL is also copied to Agentic-Errors.txt on your desktop, so if you ran it early, delete that file.
@@ -80,31 +80,31 @@ Log in as your user and run `claude`; the shell starts in /project. Claude reads
 - **Start a project:** `mkdir -p /project/src/myapp && cd $_ && git init`, then `claude`.
 - **Resume:** `claude --continue` picks up the last session in that folder; `claude --resume` lets you choose one.
 - **Claude Desktop:** the Code tab works on /project directly.
-- **Web UI:** `http://<ip>:3001` gives chat, a file editor, git and a shell, all running as your user. Use it on your LAN only.
+- **Web UI:** chat, a file editor, git and a shell, all running as your user. By default it's reachable only through an SSH tunnel: `ssh -L 3001:localhost:3001 <user>@<ip>`, then `http://localhost:3001`. Re-run the deploy script and answer `lan` to open it on `http://<ip>:3001`. To open it to your LAN later, change `HOST=127.0.0.1` to `HOST=0.0.0.0` in /etc/systemd/system/cloudcli.service, then run `sudo systemctl daemon-reload && sudo systemctl restart cloudcli`.
 - **From another PC:** Claude Desktop on your own computer can open an SSH session to the Pi (`ssh-copy-id <user>@<ip>` first; Desktop can't type passwords). `ssh <user>@<hostname>.local` also works on most networks.
 - **From your phone:** in a session, type `/rc` (Remote Control), then continue from the Claude app or claude.ai/code.
 - **No Docker:** there are no containers here. If a project needs a database server, run `sudo apt install postgresql` (or `redis-server`) yourself and use it as a normal service.
 - **Admin commands:** run `sudo apt install ...` and other root tasks yourself. Claude is blocked from sudo and su, so when it needs one it should ask you.
 - **Python:** use a venv per project (`python3 -m venv .venv`) rather than system-wide installs.
-- **Node:** `npm i -g` installs into your own ~/.local, so no sudo is needed.
+- **Node:** `npm i -g` installs into your own ~/.local, so no sudo is needed. npm skips install scripts for packages you haven't approved and lists them after the install; approve one you trust with `npm approve-scripts` in that project, or `--allow-scripts=<pkg>` on a global install.
 
 ## Maintenance
 
 Updates run on their own every Sunday at 4 AM local time; you only step in when the health check fails.
 
-`agentic-update` does one pass in six steps: OS packages (including Claude Desktop and the Pi's kernel and firmware), npm and the global dev tools, Rust, Claude Code, the web UI (if installed), then a health check.
+`agentic-update` does one pass in six steps: OS packages (including Claude Desktop and the Pi's kernel and firmware), npm and the global dev tools (including Playwright and its Chromium, and gopls), Rust, Claude Code, the web UI (if installed), then a health check.
 
 When an update or health check hits a WARN or FAIL, an entry is appended to `Agentic-Errors.txt` on your desktop (your home folder if there is no desktop). Each entry has the time, the step that failed and the last 40 lines of the log. If the file is there, something needs a look; if it isn't, every run since you last deleted it was clean. Entries older than 90 days are trimmed and the file is capped at 256 KB. Delete it once you've dealt with the problems.
 
 | Task | Command | Notes |
 | --- | --- | --- |
 | Update everything now | `sudo agentic-update` | The six steps above |
-| Health check | `sudo agentic-doctor` | Exit 0 means healthy; also checks memory, zram, page size, under-voltage and throttling (and temperature on the Pi 4) |
+| Health check | `sudo agentic-doctor` | Exit 0 means healthy; also checks memory, zram, page size, under-voltage and throttling (and temperature on the Pi 4), and warns if sudo stops asking for a password |
 | Check for problems | `cat ~/Desktop/Agentic-Errors.txt` | Only exists after a WARN or FAIL; delete it when dealt with |
 | Test phone alerts | `sudo agentic-errorlog --test-ntfy` | Only if ntfy is set up; see the next section |
 | See the real zram size | `cat /etc/agentic/zram-status`, `swapon --show` | Pi 5 |
 | Read the update log | `less /var/log/agentic-update.log` | Rotated monthly |
-| Repair the Claude setup | `sudo agentic-setup-user` | Reinstalls Claude and plugins; keeps your settings.json |
+| Repair the Claude setup | `sudo agentic-setup-user` | Reinstalls Claude if it's missing or broken, re-adds the plugins and skills, and adds any new deny rules; the rest of your settings.json is kept |
 | Web UI status and logs | `systemctl status cloudcli`, `journalctl -u cloudcli` | If installed |
 | Install logs | `/var/log/agentic-deploy/`, `/var/log/agentic-provision.log` | The provision log includes a trace of every command |
 
@@ -136,7 +136,7 @@ Treat Claude like a fast, capable colleague with shell access. Give it clear goa
 - **Use git for everything.** Commit before a big task, so a bad change is one `git reset` away. Read diffs before you push.
 - **Plan first on big tasks.** Press Shift+Tab for plan mode, or use `/superpowers:brainstorm` and then `/superpowers:write-plan`.
 - **Give it a way to verify.** Tests, a build command, or the webapp-testing skill for UIs let Claude check itself.
-- **Keep secrets out of reach.** Put credentials in `.env` files or a `secrets/` folder; the deny rules stop Claude reading those, `*.pem` and SSH keys. Never paste a token into the chat.
+- **Keep secrets out of reach.** Put credentials in `.env` files or a `secrets/` folder; the deny rules stop Claude reading those, `*.pem`, everything in ~/.ssh, and the gh, git and npm credential files. Never paste a token into the chat.
 - **Write down project rules.** Add a CLAUDE.md to each project (build, test and style commands); keep the shared /project/CLAUDE.md short.
 - **Watch auto mode.** It approves most actions on its own, behind a safety classifier and the deny rules. For risky work, switch to default mode with Shift+Tab, or use `/permissions`.
 - **Don't run Claude as root.** The `claude` command refuses to run as root here; keep it that way.
@@ -152,18 +152,35 @@ There's no container around Claude here, so the user account is the boundary. Cl
 | --- | --- | --- |
 | Claude user | Normal account; root is blocked from running `claude` | Limits what an agent mistake touches |
 | Passwords | The user's password must differ from root's | A leaked user password doesn't become root |
-| sudo | Optional, and always asks for a password. Raspberry Pi OS gives the first user passwordless sudo; the script offers to remove that rule (checked with `visudo` first) | Admin work stays with you; Claude can't type the password |
-| Claude permissions | Auto mode, plus deny rules for secrets, `dd`, `mkfs`, `rm -rf /`, `sudo` and `su` | Claude can't read credentials or escalate on its own |
-| SSH | Root and the user log in with a password or key; at most 4 tries per connection | Convenient; keep port 22 on your LAN |
-| Web UI | Runs as the user; own login; optional on the Pi 5 | Plain HTTP on port 3001: LAN only, or put it behind a TLS reverse proxy |
+| sudo | Optional, and asks for a password. Raspberry Pi OS gives the first user passwordless sudo; the script checks every sudoers file for a NOPASSWD rule that covers the user (directly, through ALL, or through a group such as `sudo`) and offers to remove it, checking each edit with `visudo`. `agentic-doctor` warns if one comes back | Admin work stays with you; Claude can't type the password |
+| Claude permissions | Auto mode, plus deny rules for secrets and credential files (~/.ssh, gh, git, npm), `dd`, `mkfs`, `rm -rf /`, `sudo` and `su` | Claude can't read credentials or escalate on its own |
+| npm install scripts | Allowed only for the web UI's four native modules; the weekly tool updates run with none | A compromised package can't run code as root when it's installed |
+| SSH | The user logs in with a password or key. Root is key only unless you choose "password" at deploy, which the script warns against (each re-run asks again); at most 4 tries per connection | A guessable root password over the network would be the whole Pi; keep port 22 on your LAN |
+| Web UI | Runs as the user; own login; optional on the Pi 5; listens on the Pi only unless you chose LAN at deploy, and starts only after setup is finished | Plain HTTP on port 3001: use an SSH tunnel, or keep LAN access to a trusted network or behind a TLS reverse proxy |
 | Phone alerts | Off unless you set an ntfy topic; settings file is root-only | A guessable topic would let others read your alerts |
 | Updates | Weekly, with health check | Keeps the OS, Pi firmware, Claude Desktop and Claude Code patched |
 
 Further hardening you can add:
 
-- Turn on the firewall (`sudo apt install ufw`, `sudo ufw allow from <your-lan> to any port 22,3001 proto tcp`, then `sudo ufw enable`).
+- Turn on the firewall (`sudo apt install ufw`, `sudo ufw allow from <your-lan> to any port 22 proto tcp`, plus port 3001 if you chose LAN access for the web UI, then `sudo ufw enable`).
 - Use SSH keys, and set PasswordAuthentication no in /etc/ssh/sshd_config.d/00-agentic.conf once they work.
-- If you never need root over SSH, set PermitRootLogin no in that same file.
+- If you never need root over SSH, set PermitRootLogin no in that same file. (Re-running the script resets it to your key-only or password choice.)
+
+## Uninstalling
+
+Run `sudo bash Claude_Code_Raspberry_Pi_5_Deployer.sh --uninstall` (or the same with the Pi 4 script). It asks its questions first, shows what it will do, and changes nothing until you type `uninstall`. Everything is logged under `/var/log/agentic-deploy/`. Run the script with `--help` to see its options; any other option is refused, so a typo can't start an install.
+
+| Part | What happens |
+| --- | --- |
+| Web UI, the agentic-* tools, the weekly update, /etc/agentic, /usr/local/share/agentic, the root `claude` stub, the SSH and apt drop-ins, the shell block in .bashrc, the npm install-script setting | Always removed. The two SSH lines the script edited in sshd_config go back to how they were before the first deploy (on a box deployed before this version, to the OS defaults: root by key only, passwords allowed for everyone else). If you removed the shell block's closing `cd /project` line from a .bashrc, that file is left alone and the uninstall tells you to remove the block by hand |
+| Go, Rust, gopls, rust-analyzer, the global npm tools, Playwright and its browsers | Asked; the default is yes |
+| Node.js, gh, Claude Desktop, clangd and their apt repositories | Asked; the default is no, because other software may use them |
+| The memory tuning (zram-tools swap, kernel memory settings, the rpi-swap size) | Asked; the default is yes. Applies after a reboot |
+| The config.txt change (Pi 4 `arm_boost`, Pi 5 4K-page kernel) | Asked when present; the default is yes. config.txt is backed up first, and the change applies after a reboot |
+| The Claude user's Claude data (~/.claude, the claude install, ~/.cloudcli, the notes card, Agentic-Errors.txt) | Asked; the default is no. Deleting it signs Claude out and removes its settings, plugins and history |
+| The user account, /project, root's password, hostname, timezone, the SSH server, base packages, group memberships and the sudoers edits | Kept. The sudoers backups stay in `/root/*.agentic-bak` |
+
+Log out and back in afterwards, so your shells drop the old PATH and settings.
 
 ## Troubleshooting
 
@@ -181,6 +198,7 @@ Start with Agentic-Errors.txt on your desktop if it exists, then `sudo agentic-d
 | Claude Desktop won't start | It needs a desktop session (not a Lite image) and a 64-bit OS. Run `claude-desktop` in a terminal to see the error. |
 | `claude: not run as root` | Expected. Use `su - <user>`, then `claude`. |
 | `claude: command not found` as the user | Run `sudo agentic-setup-user`. |
-| Web UI not on :3001 | If you turned it off, re-run the script and say yes. Otherwise `journalctl -u cloudcli -n 50`, then `sudo agentic-update` (it rebuilds native modules). |
+| Web UI won't open | It's local only unless you chose LAN: use the SSH tunnel above. If you turned it off, re-run the script and say yes. Otherwise check `journalctl -u cloudcli -n 50`, then `sudo agentic-update` (it rebuilds native modules). |
+| Doctor: "sudo asks for a password" WARN | A NOPASSWD rule (or `Defaults !authenticate`) lets the user use sudo without a password, which an auto-mode agent could use. `sudo -l -U <user>` shows it; remove it with `sudo visudo` or by editing the file in /etc/sudoers.d/, or re-run the deploy script and say yes when it offers to. |
 | `sudo` asks for a password Claude can't give | Expected. Run the command yourself. |
 | No ntfy push arrives | Run `sudo agentic-errorlog --test-ntfy`; it names the failure. Check the topic matches the one in the app, and the token if your server needs one. |

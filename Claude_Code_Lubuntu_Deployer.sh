@@ -64,6 +64,9 @@
 #   3. Write the box's notes card (/etc/agentic/README.md), print the summary
 #      and offer the reboot (the kvm group and any new kernel need one).
 #
+# Uninstall: sudo bash Claude_Code_Lubuntu_Deployer.sh --uninstall
+#   (asks what to remove first; see uninstall() near the bottom).
+#
 # Safe to re-run: existing users, settings and shell blocks are kept, and the
 # installers skip what's already there — on a failure, fix the cause and run
 # it again (there's no container to throw away).
@@ -83,9 +86,11 @@
 #   /usr/local/share/agentic/    shared Claude settings template, shell block and
 #                                the staged webapp-testing skill
 #   ~USER/.claude/settings.json  the user's Claude Code settings (auto mode + the
-#                                deny floor); never overwritten by a re-run
+#                                deny floor); a re-run only adds new deny rules
 #   /project/CLAUDE.md           what Claude is told about this box
 #   /etc/agentic/README.md       the notes card (copy: ~USER/CLAUDE-BOX.md)
+#   /etc/agentic/os-packages-kept  OS packages kept from autoremove on the first
+#                                run (marked manual; see the provision script)
 #   Agentic-Errors.txt           WARN/FAIL lines from agentic-update/-doctor, on
 #                                the user's desktop (home folder if none)
 #   /var/log/agentic-deploy/, /var/log/agentic-provision.log,
@@ -139,6 +144,21 @@ is_current_password() {
   hash=$(getent shadow "$1" | cut -d: -f2)
   [[ -n "$hash" && "$hash" != [\!*]* ]] || return 1
   PW="$2" H="$hash" perl -e 'exit(crypt($ENV{PW}, $ENV{H}) eq $ENV{H} ? 0 : 1)'
+}
+
+# nopasswd_rules <user> <gets-sudo yes|no>
+# Prints every sudoers line that would let <user> use sudo without a password:
+# NOPASSWD rules for the user, for ALL, or for a group they're in or are about
+# to join (sudo) — in /etc/sudoers or any drop-in — plus "Defaults !authenticate".
+# Read from the files rather than `sudo -l -U`, because a new user (or a new
+# sudo member) isn't covered by those rules until provisioning has run.
+nopasswd_rules() {
+  local p g principals="$1 ALL"
+  for g in $(id -nG "$1" 2>/dev/null) $([[ "$2" == yes ]] && echo sudo); do principals+=" %$g"; done
+  for p in $principals; do
+    grep -hsE "^[[:space:]]*${p}[[:space:]].*NOPASSWD" /etc/sudoers /etc/sudoers.d/* || true
+  done | sort -u
+  grep -hsE '^[[:space:]]*Defaults.*!authenticate' /etc/sudoers /etc/sudoers.d/* || true
 }
 
 # ── Install log ──────────────────────────────────────────────────────────────
@@ -293,6 +313,52 @@ check_virt() {
 }
 
 # ── Configuration ───────────────────────────────────────────────────────────
+
+# Ask how root may log in over SSH. "key" (the default) is PermitRootLogin
+# prohibit-password: root needs an SSH key, and its password is never accepted
+# over the network (the console and `su -` still take it). "password" keeps
+# root's password usable over SSH, which lets anyone who can reach port 22
+# try to guess it. Asked on every run, so a re-run can switch either way; the
+# previous answer is the default.
+ask_root_ssh() {
+  local ans def=key has_key=no
+  if grep -qs '^# root SSH: password' /etc/ssh/sshd_config.d/00-agentic.conf; then def=password; fi
+  if [[ -n "${CT_SSH_KEY:-}" ]] || [[ -s /root/.ssh/authorized_keys ]]; then has_key=yes; fi
+  while true; do
+    read -rp "Root SSH login: key only, or password allowed too? [key/password, default $def]: " ans
+    case "${ans:-$def}" in
+      k|key) CT_ROOT_SSH=key ;;
+      p|password) CT_ROOT_SSH=password ;;
+      *) warn "Please answer key or password."; continue ;;
+    esac
+    break
+  done
+  if [[ "$CT_ROOT_SSH" == password ]]; then
+    warn "Root's password will work over SSH. Anyone who can reach port 22 can try to guess it,"
+    warn "and a guessed root password is the whole machine. Use a long, unique password, keep"
+    warn "port 22 off the internet, and re-run this script and choose key once a key works."
+  elif [[ "$has_key" == no ]]; then
+    warn "No SSH key is set up for root, so root can't log in over SSH at all. The console"
+    warn "and su - from the Claude user still work. To allow root over SSH, add a key to"
+    warn "/root/.ssh/authorized_keys (or give one at the key prompt when you re-run this script)."
+  fi
+}
+
+# Ask where the web UI (port 3001) should listen. Local is the default: the UI
+# is a full shell as the Claude user, so only open it to the LAN on purpose.
+# Asked on every run, so a re-run can switch it either way.
+ask_webui_bind() {   # $1 = what "local" means here, e.g. "this machine"
+  local ans
+  while true; do
+    read -rp "Web UI (port 3001) reachable from $1 only, or from your LAN? [local/lan, default local]: " ans
+    case "${ans,,}" in
+      ""|l|local) CT_WEBUI_BIND=127.0.0.1; return ;;
+      lan)        CT_WEBUI_BIND=0.0.0.0; return ;;
+      *)          warn "Please answer local or lan." ;;
+    esac
+  done
+}
+
 # Asks everything up front (nothing is changed until "Proceed? y"), so the rest
 # of the run is unattended. Sets the HOST_* / CT_* globals used by every later
 # step (CT_* names kept from the Proxmox deployer so the shared parts line up).
@@ -329,6 +395,20 @@ get_config() {
   if [[ -n "$CT_SSH_KEY" && ! -f "$CT_SSH_KEY" ]]; then
     error "SSH public key not found: $CT_SSH_KEY"
   fi
+  # It must be ONE public key line ("ssh-ed25519 AAAA... comment"). Giving the
+  # private key by mistake (id_ed25519 instead of id_ed25519.pub) would copy it
+  # onto this machine and into authorized_keys, so that's refused outright.
+  if [[ -n "$CT_SSH_KEY" ]]; then
+    if grep -q 'PRIVATE KEY' "$CT_SSH_KEY"; then
+      error "$CT_SSH_KEY is a PRIVATE key. Give the public one instead (${CT_SSH_KEY%.pub}.pub); nothing was changed."
+    fi
+    if [[ "$(grep -cv '^[[:space:]]*$' "$CT_SSH_KEY")" -ne 1 ]] \
+       || ! grep -qE '^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp[0-9]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/=]+' "$CT_SSH_KEY" \
+       || { command -v ssh-keygen >/dev/null 2>&1 && ! ssh-keygen -l -f "$CT_SSH_KEY" >/dev/null 2>&1; }; then
+      error "$CT_SSH_KEY isn't a single SSH public key line (like the contents of ~/.ssh/id_ed25519.pub)."
+    fi
+  fi
+  ask_root_ssh
 
   # ntfy push alerts (optional). When agentic-update or agentic-doctor hits a
   # WARN/FAIL, agentic-errorlog writes Agentic-Errors.txt as always and, if a
@@ -442,11 +522,17 @@ get_config() {
   # Ubuntu's sudo asks for the password by default, but a NOPASSWD rule may have
   # been added since. Offer to remove it, so "sudo needs your password, which
   # Claude can't type" holds.
+  # The check covers every sudoers file and group rules such as %sudo, not
+  # just drop-ins that name the user (see nopasswd_rules above).
   CT_FIX_NOPASSWD="no"
-  if grep -qsE "^[[:space:]]*${CT_USER}[[:space:]].*NOPASSWD" /etc/sudoers.d/* 2>/dev/null; then
-    local ans
-    warn "$CT_USER has passwordless sudo."
-    read -rp "Make sudo ask $CT_USER for a password (recommended for an auto-mode agent)? [Y/n]: " ans
+  local nopw
+  nopw="$(nopasswd_rules "$CT_USER" "$CT_USER_SUDO")"
+  if [[ -n "$nopw" ]]; then
+    local ans l
+    warn "$CT_USER would get passwordless sudo from:"
+    while IFS= read -r l; do warn "    $l"; done <<< "$nopw"
+    info "Fixing it edits those rules, so a group rule (like %sudo) changes for every member of that group."
+    read -rp "Make sudo ask $CT_USER for a password (strongly recommended for an auto-mode agent)? [Y/n]: " ans
     [[ "$ans" =~ ^[Nn] ]] || CT_FIX_NOPASSWD="yes"
     if [[ "$CT_FIX_NOPASSWD" == yes && "$setpw" != yes ]]; then
       info "sudo will use $CT_USER's existing login password."
@@ -457,10 +543,8 @@ get_config() {
   # QEMU/KVM stack, the kvm group and the vhost_vsock module come with it.
   # Needs a desktop session to launch (Lubuntu's LXQt is fine).
   echo ""
-  # A desktop counts when EITHER folder has a session file. (An earlier
-  # `ls wayland-sessions/*.desktop xsessions/*.desktop` needed BOTH: ls fails
-  # if any one pattern matches nothing, so Lubuntu with only X11 or only
-  # Wayland sessions was wrongly reported as having no desktop.)
+  # A desktop counts when EITHER folder has a session file, so an X11-only or
+  # Wayland-only desktop is found too.
   # compgen -G <glob> prints the matching files and succeeds only when at
   # least one exists; unlike ls, an empty or missing folder is not an error.
   if compgen -G '/usr/share/wayland-sessions/*.desktop' >/dev/null \
@@ -477,6 +561,8 @@ get_config() {
     [[ "$CT_DESKTOP" =~ ^[Yy] ]] && CT_DESKTOP="yes" || CT_DESKTOP="no"
   fi
 
+  ask_webui_bind "this machine"
+
   echo ""
   # Everything chosen above, for a last look: nothing on the system has changed
   # yet, and answering anything but y at "Proceed?" leaves it that way.
@@ -490,7 +576,8 @@ get_config() {
   echo "  Timezone:  $CT_TZ"
   echo "  User:      $CT_USER ($([[ $CT_USER_EXISTS == yes ]] && echo existing || echo new); sudo: $CT_USER_SUDO$([[ $CT_FIX_NOPASSWD == yes ]] && echo ', password now required'))"
   echo "  Password:  $([[ -n "${CT_USER_PASSWORDS[$CT_USER]:-}" ]] && echo "new for $CT_USER" || echo "$CT_USER keeps theirs"); root password set"
-  echo "  SSH:       root + $CT_USER, password$([[ -n "$CT_SSH_KEY" ]] && echo " or key")"
+  echo "  SSH:       $CT_USER by password$([[ -n "$CT_SSH_KEY" ]] && echo " or key"); root by $([[ $CT_ROOT_SSH == key ]] && echo 'key only' || echo 'password or key (WARNING: guessable over the network)')"
+  echo "  Web UI:    port 3001, $([[ $CT_WEBUI_BIND == 0.0.0.0 ]] && echo 'open to the LAN' || echo 'local only (reach it through an SSH tunnel)')"
   echo "  Alerts:    Agentic-Errors.txt$([[ -n "$CT_NTFY_TOPIC" ]] && echo " + ntfy push to $CT_NTFY_TOPIC$([[ -n "$CT_NTFY_TOKEN" ]] && echo ' (with token)')")"
   echo "  Desktop:   Claude Desktop $([[ $CT_DESKTOP == yes ]] && echo 'yes (Chat + Code + Cowork)' || echo no)"
   [[ "$CT_DESKTOP" == yes ]] && echo "  Cowork VM: $VIRT_NOTE"
@@ -550,11 +637,17 @@ PROVISION_LOG=/var/log/agentic-provision.log
 exec > >(tee -a "$PROVISION_LOG") 2>&1
 exec 19>>"$PROVISION_LOG"
 BASH_XTRACEFD=19
-trap 'rc=$?; echo "!!! provisioning FAILED (exit $rc) at line $LINENO: $BASH_COMMAND — full log: $PROVISION_LOG"' ERR
+# On a failure, also delete the secret files the deployer handed over (they
+# are normally removed as soon as they've been applied).
+trap 'rc=$?; rm -f /root/agentic-provision.env /root/agentic-provision.chpasswd /root/agentic-provision.pub; echo "!!! provisioning FAILED (exit $rc) at line $LINENO: $BASH_COMMAND — full log: $PROVISION_LOG"' ERR
 set -x
+# The env file holds the ntfy topic and token, so the trace is switched off
+# while it's read: a traced `source` would copy every value into this log.
 # AGENTIC_USERS / AGENTIC_PRIMARY / AGENTIC_SUDO / AGENTIC_TZ / AGENTIC_DESKTOP /
 # AGENTIC_FIX_NOPASSWD / AGENTIC_OS, written by the deployer from its prompts
+set +x
 source /root/agentic-provision.env
+set -x
 # sudo may hand us a LANG from your desktop session that this script shouldn't
 # depend on — every perl/apt call with a missing locale spews "Setting locale
 # failed". C.UTF-8 is always built in; the system default is only touched
@@ -565,20 +658,20 @@ unset LC_ALL LANGUAGE
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo ">>> Waiting for Ubuntu's first-boot apt jobs to finish..."
-# A freshly installed Lubuntu kicks off apt-daily / unattended-upgrades (and the
-# desktop's update notifier) right after the first login, and they hold the apt/dpkg locks — our first
-# apt-get then dies with "Could not get lock /var/lib/apt/lists/lock". Pause the
-# timers so nothing new starts mid-provision, wait out a job that really holds
-# the apt/dpkg lock, and tell apt itself to wait on a held lock rather than fail.
+# A freshly installed Lubuntu kicks off apt-daily / unattended-upgrades (and
+# the desktop's update notifier) right after the first login, and they hold the
+# apt/dpkg locks, so our first apt-get would die with "Could not get lock
+# /var/lib/apt/lists/lock". Pause the timers so nothing new starts
+# mid-provision, wait out a job that really holds the apt/dpkg lock, and tell
+# apt itself to wait on a held lock rather than fail.
 systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 command -v cloud-init >/dev/null 2>&1 && timeout 120 cloud-init status --wait >/dev/null 2>&1 || true
-# Wait only while a process actually HOLDS one of apt/dpkg's lock files. The
-# old check matched process NAMES, and 'unattended-upgr' is always running on
-# a normal install: unattended-upgrades.service keeps its shutdown helper
-# (unattended-upgrade-shutdown --wait-for-signal) alive all day, so every run
-# sat out the full 10 minutes for nothing. Now: who holds a lock is printed,
-# and after 3 minutes we carry on anyway — apt's own DPkg::Lock::Timeout
-# (set just below) then waits for the lock instead of failing.
+# Wait only while a process actually HOLDS one of apt/dpkg's lock files.
+# Matching process names doesn't work: unattended-upgrades keeps a shutdown
+# helper (unattended-upgrade-shutdown --wait-for-signal) running all day, so a
+# name check would always wait the full time for nothing. Who holds a lock is
+# printed, and after 3 minutes we carry on anyway; apt's own
+# DPkg::Lock::Timeout (set just below) then waits for the lock instead of failing.
 # The four lock files apt and dpkg take: lock-frontend (any apt/dpkg front
 # end), lock (the dpkg database), lists/lock (apt update) and archives/lock
 # (package downloads). A process holding any of them means apt is busy.
@@ -613,6 +706,26 @@ if [ "$APT_WAITED" -eq 0 ]; then echo "    no apt/dpkg lock held; continuing"; f
 cat > /etc/apt/apt.conf.d/99agentic-lock-wait << 'APTLOCK'
 DPkg::Lock::Timeout "600";
 APTLOCK
+
+# A Lubuntu install can leave packages marked "automatically installed" that
+# nothing depends on any more (the installer's own leftovers, or tools you
+# rely on that came in as a dependency). The autoremove at the end of this
+# script, and the weekly one in agentic-update, would delete them, which is not
+# what anyone asked for. So on the first run, before we install or remove
+# anything, mark whatever is already autoremovable as manually installed.
+# Autoremove then only takes what this script itself leaves orphaned. The
+# marker file keeps later runs from doing it again.
+if [ ! -f /etc/agentic/os-packages-kept ]; then
+  # Simulate (-s) an autoremove; each "Remv <pkg> [...]" line is one package.
+  OS_LEFTOVERS="$(apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print $2}')"
+  if [ -n "$OS_LEFTOVERS" ]; then
+    # shellcheck disable=SC2086
+    apt-mark manual $OS_LEFTOVERS >/dev/null 2>&1 || true
+    echo "    keeping the OS's own unused packages (not auto-removed): $(echo $OS_LEFTOVERS | wc -w)"
+  fi
+  mkdir -p /etc/agentic
+  printf '%s\n' $OS_LEFTOVERS > /etc/agentic/os-packages-kept
+fi
 
 echo ">>> Setting timezone to $AGENTIC_TZ..."
 # Chosen at the prompt (defaults to what the Lubuntu installer already set, or
@@ -751,23 +864,37 @@ rm -f /root/agentic-provision.chpasswd
 # Answered at the prompt (default yes): from now on sudo asks for the password,
 # which Claude can't type.
 if [ "$AGENTIC_FIX_NOPASSWD" = yes ]; then
-  # For each sudoers drop-in that gives the user NOPASSWD: back it up, strip
-  # the NOPASSWD: tag, and keep the edit only if visudo still accepts the file
-  # (a broken sudoers file would lock everyone out of sudo).
-  for f in /etc/sudoers.d/*; do
-    [ -f "$f" ] || continue
-    for u in $AGENTIC_USERS; do
-      if grep -qE "^[[:space:]]*${u}[[:space:]].*NOPASSWD" "$f"; then
-        cp -a "$f" "/root/$(basename "$f").agentic-bak"
-        sed -i -E "s/^([[:space:]]*${u}[[:space:]].*)NOPASSWD:[[:space:]]*/\1/" "$f"
-        if visudo -cf "$f" >/dev/null; then
-          echo "    $u: sudo now asks for a password (was NOPASSWD in $f; backup in /root)"
-        else
-          cp -a "/root/$(basename "$f").agentic-bak" "$f"
-          echo "    [WARN] edited $f failed visudo; restored it unchanged"
-        fi
+  # Every sudoers file (the main one and each drop-in) with a NOPASSWD rule for
+  # the user, for ALL, or for one of the user's groups (%sudo, ...): back it up
+  # once, strip the NOPASSWD: tags, and keep the edit only if visudo still
+  # accepts the file (a broken sudoers file would lock everyone out of sudo).
+  for u in $AGENTIC_USERS; do
+    PRINCIPALS="$u ALL"
+    for g in $(id -nG "$u"); do PRINCIPALS="$PRINCIPALS %$g"; done
+    for f in /etc/sudoers /etc/sudoers.d/*; do
+      [ -f "$f" ] || continue
+      HITS=""
+      for p in $PRINCIPALS; do
+        if grep -qE "^[[:space:]]*${p}[[:space:]].*NOPASSWD" "$f"; then HITS="$HITS $p"; fi
+      done
+      [ -n "$HITS" ] || continue
+      BAK="/root/$(basename "$f").agentic-bak"
+      cp -a "$f" "$BAK"
+      for p in $HITS; do
+        sed -i -E "s/^([[:space:]]*${p}[[:space:]].*)NOPASSWD:[[:space:]]*/\1/" "$f"
+      done
+      if visudo -cf "$f" >/dev/null; then
+        echo "   $HITS: sudo now asks for a password (was NOPASSWD in $f; backup: $BAK)"
+      else
+        cp -a "$BAK" "$f"
+        echo "    [WARN] edited $f failed visudo; restored it unchanged"
       fi
     done
+    # Then ask sudo itself, which sees every file and rule (and Defaults
+    # !authenticate, which isn't edited here).
+    if sudo -l -U "$u" 2>/dev/null | grep -qE 'NOPASSWD|!authenticate'; then
+      echo "    [WARN] $u can still use sudo without a password ('sudo -l -U $u' shows the rule); fix it by hand with visudo"
+    fi
   done
 fi
 # Optional SSH public key from the prompt: added once to root's and the
@@ -780,11 +907,12 @@ if [ -s /root/agentic-provision.pub ]; then
   chmod 600 /root/.ssh/authorized_keys
   for u in $AGENTIC_USERS; do
     h="$(getent passwd "$u" | cut -d: -f6)"
-    install -d -m 700 -o "$u" -g "$u" "$h/.ssh"
-    grep -qxF "$(cat /root/agentic-provision.pub)" "$h/.ssh/authorized_keys" 2>/dev/null \
-      || cat /root/agentic-provision.pub >> "$h/.ssh/authorized_keys"
-    chown "$u:$u" "$h/.ssh/authorized_keys"
-    chmod 600 "$h/.ssh/authorized_keys"
+    # Written AS the user (the key comes in on stdin, since they can't read
+    # root's copy): a symlink planted in their home can't redirect a root
+    # write. sshd wants ~/.ssh 700 and authorized_keys 600.
+    runuser -u "$u" -- sh -c 'cd "$1" && install -d -m 700 .ssh && k="$(cat)" \
+      && { grep -qxF "$k" .ssh/authorized_keys 2>/dev/null || printf "%s\n" "$k" >> .ssh/authorized_keys; } \
+      && chmod 600 .ssh/authorized_keys' sh "$h" < /root/agentic-provision.pub
   done
 fi
 rm -f /root/agentic-provision.pub
@@ -803,6 +931,9 @@ EOF
 # alerts can be turned on later; a re-run that skipped the prompt keeps it.
 # printf %q (below) quotes each value, so the file stays safe to `source`
 # even if a value has spaces or shell characters in it.
+# The trace is off for this block too (it would print the topic and token),
+# and the values are dropped from the environment right after.
+set +x
 if [ -n "${AGENTIC_NTFY_TOPIC:-}" ] || [ ! -f /etc/agentic/ntfy.conf ]; then
   ( umask 077; cat > /etc/agentic/ntfy.conf << EOF
 # ntfy push alerts. agentic-errorlog sends one short push whenever agentic-update
@@ -821,12 +952,15 @@ NTFY_TOKEN=$(printf '%q' "${AGENTIC_NTFY_TOKEN:-}")
 EOF
   )
 fi
+unset AGENTIC_NTFY_TOPIC AGENTIC_NTFY_SERVER AGENTIC_NTFY_TOKEN
+set -x
 rm -f /root/agentic-provision.env
 
 echo ">>> Setting up the shared toolchain environment..."
 # Toolchains are installed once, system-wide (root-owned, updated by
-# agentic-update); the user's shells and the CloudCLI service point at them. /etc/environment covers PAM logins (SSH,
-# su, sudo -i); /etc/profile.d covers login shells; the bashrc block below covers
+# agentic-update); the user's shells and the CloudCLI service point at them.
+# /etc/environment covers PAM logins (SSH, su, sudo -i); /etc/profile.d covers
+# login shells; the bashrc block below covers
 # terminals opened on the desktop (QTerminal).
 # For the rest of THIS script: rustup installs into /opt/rust, and its
 # cargo/rustc proxies are on PATH for the language-server step below.
@@ -877,13 +1011,17 @@ if [ "$NODE_FRESH" = yes ]; then
   npm install -g "${NPM_QUIET[@]}" npm@latest || echo "    [WARN] npm self-update failed; using bundled npm"
 fi
 echo "    Node.js $(node --version) / npm $(npm --version)"
-# npm 12+ blocks dependencies' install scripts behind an allowlist (separate from
-# ignore-scripts), so native modules like CloudCLI's better-sqlite3/node-pty/
-# bcrypt never compile and the service crash-loops with no bind on :3001. We just
-# took npm to latest (>=12), so set the allowlist NOW, before any native install
-# below (CloudCLI, Playwright, the language servers). It persists to /root/.npmrc
-# under npm 12+; harmless if npm is still <12.
-npm config set dangerously-allow-all-scripts true 2>/dev/null || true
+# npm 12+ blocks packages' install scripts unless they're on an allowlist, so
+# CloudCLI's native modules (better-sqlite3, node-pty, bcrypt) would never
+# compile and the service would crash-loop with nothing on :3001. Allow exactly
+# those four and nothing else: every other global tool here installs without
+# scripts, and a compromised package anywhere else can't run code as root at
+# install time. Set NOW, before the installs below; it persists to /root/.npmrc.
+# npm <12 rejects the key (and runs all scripts anyway), hence the || true.
+# An older deploy's allow-everything setting is removed.
+NPM_ALLOW_SCRIPTS="@cloudcli-ai/cloudcli,bcrypt,better-sqlite3,node-pty"
+npm config delete dangerously-allow-all-scripts 2>/dev/null || true
+npm config set allow-scripts="$NPM_ALLOW_SCRIPTS" 2>/dev/null || true
 
 echo ">>> Installing global npm packages..."
 # Only what's missing, so a re-run doesn't reinstall all of them.
@@ -909,10 +1047,20 @@ GO_ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
 if [ "$(/usr/local/go/bin/go env GOVERSION 2>/dev/null)" = "$GO_VERSION" ]; then
   echo "    $GO_VERSION already installed; skipping download"
 else
-  curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
+  # Downloaded into a fresh private temp dir, and checked against the sha256
+  # go.dev publishes for this exact file before anything is unpacked.
+  GO_TGZ="${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
+  GO_SHA="$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r --arg f "$GO_TGZ" '.[].files[] | select(.filename == $f) | .sha256')"
+  GO_TMP="$(mktemp -d)"
+  curl -fsSL "https://go.dev/dl/$GO_TGZ" -o "$GO_TMP/go.tar.gz"
+  if [ -z "$GO_SHA" ] || ! echo "$GO_SHA  $GO_TMP/go.tar.gz" | sha256sum -c --quiet -; then
+    rm -rf "$GO_TMP"
+    echo "!!! $GO_TGZ doesn't match the checksum on go.dev; not installing it"
+    exit 1
+  fi
   rm -rf /usr/local/go
-  tar -C /usr/local -xzf /tmp/go.tar.gz
-  rm /tmp/go.tar.gz
+  tar -C /usr/local -xzf "$GO_TMP/go.tar.gz"
+  rm -rf "$GO_TMP"
 fi
 # Written, not appended, so re-runs don't stack duplicate PATH lines.
 echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
@@ -935,8 +1083,9 @@ echo "    Rust $(rustc --version | awk '{print $2}')"
 
 # No Docker on this box, by design: Claude and everything it builds run
 # natively on Lubuntu as the one user — no containers. (Cowork's VM is the one
-# exception, and Claude Desktop starts and manages it by itself.) Services a project needs (PostgreSQL, Redis, ...) are installed
-# with apt and run as normal systemd services.
+# exception, and Claude Desktop starts and manages it by itself.) Services a
+# project needs (PostgreSQL, Redis, ...) are installed with apt and run as
+# normal systemd services.
 
 echo ">>> Writing shared Claude Code defaults (permissions + env + plugins)..."
 # Claude Code itself is installed for the user (by agentic-setup-user, below) —
@@ -945,14 +1094,13 @@ echo ">>> Writing shared Claude Code defaults (permissions + env + plugins)..."
 # template ~/.claude/settings.json starts from, the webapp-testing skill, and
 # the shell block (used again if you re-run agentic-setup-user).
 #
-# NOTE on enabledPlugins: we DO declare it here. Earlier belief was that
-# enabledPlugins is ignored in non-interactive/container contexts — that's
-# wrong. `claude plugin install X@mkt` installs the plugin but leaves it
-# Status: disabled; the enabled-state lives in enabledPlugins in THIS file
-# (user settings, ~/.claude/settings.json), which IS honored. Without this
-# block every plugin below (including the LSP servers) stays disabled and
-# CloudCLI's /project chat shows only the 1 local skill. Enabled skills show
-# up live after the cloudcli restart — no fresh session needed.
+# enabledPlugins: `claude plugin install X@mkt` installs a plugin but leaves it
+# disabled. Whether it's on is read from enabledPlugins in the user settings
+# (~/.claude/settings.json, which this template becomes), and that is honored
+# in non-interactive runs and containers too. Without this block every plugin
+# below (the LSP servers included) stays off, and CloudCLI's /project chat
+# shows only the one local skill. Enabled skills show up after the cloudcli
+# restart at the end; no new session is needed.
 #
 # Verified keys (checked against code.claude.com/docs, 2026-10): everything
 # below is current. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS must live inside "env"
@@ -1008,6 +1156,12 @@ cat > /usr/local/share/agentic/claude-settings.json << 'SETTINGS'
       "Read(**/*.pem)",
       "Read(**/id_rsa)",
       "Read(**/id_ed25519)",
+      "Read(**/id_ecdsa)",
+      "Read(~/.ssh/**)",
+      "Read(~/.config/gh/hosts.yml)",
+      "Read(~/.git-credentials)",
+      "Read(~/.netrc)",
+      "Read(~/.npmrc)",
       "Bash(dd *)",
       "Bash(mkfs*)",
       "Bash(rm -rf / *)",
@@ -1072,13 +1226,16 @@ echo ">>> Staging webapp-testing skill (from anthropics/skills)..."
 # Installed as a plain user skill (NOT a marketplace plugin). A SKILL.md placed
 # under ~/.claude/skills/ is picked up automatically with no plugin entry needed.
 # Staged here; agentic-setup-user copies it into the user's ~/.claude/skills.
-git clone --depth 1 --filter=blob:none --sparse https://github.com/anthropics/skills.git /tmp/anthropic-skills
-cd /tmp/anthropic-skills && git sparse-checkout set skills/webapp-testing
+# Cloned into a fresh private temp dir (a fixed /tmp path could already exist,
+# left over or made by someone else, and stop a re-run).
+SKILLS_TMP="$(mktemp -d)"
+git clone --depth 1 --filter=blob:none --sparse https://github.com/anthropics/skills.git "$SKILLS_TMP/skills"
+cd "$SKILLS_TMP/skills" && git sparse-checkout set skills/webapp-testing
 rm -rf /usr/local/share/agentic/skills/webapp-testing
-cp -r /tmp/anthropic-skills/skills/webapp-testing /usr/local/share/agentic/skills/webapp-testing
+cp -r "$SKILLS_TMP/skills/skills/webapp-testing" /usr/local/share/agentic/skills/webapp-testing
 chmod -R a+rX /usr/local/share/agentic
-rm -rf /tmp/anthropic-skills
 cd /
+rm -rf "$SKILLS_TMP"
 
 echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
 # The webapp-testing skill imports the PYTHON playwright package
@@ -1088,15 +1245,22 @@ echo ">>> Installing Playwright (Python) for the webapp-testing skill..."
 # system site-packages the user imports from. Both share the same browser cache
 # — PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright, not root's ~/.cache, so the
 # user can launch it — and Chromium is downloaded once for both.
-# Playwright supports Ubuntu 26.04 natively since 1.61 (microsoft/playwright#40117
-# is closed), so the old PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 hack
-# is gone and must not be set — it would pull the wrong browser build. This whole
-# block is non-fatal: a browser-install failure must NEVER abort provisioning
-# (it previously killed everything after it — SSH, the web UI, cron —
-# because the script runs under `set -e`).
+# Playwright supports Ubuntu 26.04 natively (since 1.61), so
+# PLAYWRIGHT_HOST_PLATFORM_OVERRIDE must not be set: it would pull the wrong
+# browser build. This whole block is non-fatal: a failed browser install must
+# never stop provisioning, which runs under `set -e` and would otherwise skip
+# everything after it (SSH, the web UI, the weekly update).
 # set +e: until the matching set -e below, a failing command doesn't stop the run.
 set +e
 unset PLAYWRIGHT_HOST_PLATFORM_OVERRIDE
+# The browser cache is root's: root downloads into it and the users can only
+# read it, so nothing planted there can redirect a root write. An older deploy
+# gave it to the Claude user; such a copy is deleted and downloaded again
+# rather than written into.
+if [ -d /opt/ms-playwright ] && find /opt/ms-playwright ! -user root -print -quit | grep -q .; then
+  echo "    taking /opt/ms-playwright back from the user (re-downloading Chromium)"
+  rm -rf /opt/ms-playwright
+fi
 # Re-runs: skip when the package imports and its Chromium is already in the
 # shared cache (pip without -U never changes the version, so they still match).
 # Skip only when BOTH are there: the pip package imports AND a Chromium
@@ -1107,25 +1271,35 @@ else
   pip install --break-system-packages --root-user-action=ignore -q playwright \
     && echo "    python playwright package installed" \
     || echo "    [WARN] pip install playwright failed (webapp-testing skill will error on import)"
-  if python3 -m playwright install --with-deps chromium; then
-    echo "    Playwright chromium + OS deps installed"
-  elif python3 -m playwright install chromium; then
-    echo "    Playwright chromium installed (browser only; some OS deps may be missing)"
+  # Chromium's OS libraries (install-deps, via apt) and the browser itself, both
+  # as root into the root-owned cache.
+  install -d -m 755 /opt/ms-playwright
+  python3 -m playwright install-deps chromium \
+    || echo "    [WARN] some of Chromium's OS libraries didn't install (browser tests may fail)"
+  if PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install chromium; then
+    echo "    Playwright chromium installed in /opt/ms-playwright"
   else
     echo "    [WARN] Playwright browser install failed. Retry later with:"
-    echo "      sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install --with-deps chromium"
+    echo "      sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -m playwright install chromium"
   fi
 fi
 set -e
 
 echo ">>> Setting up /project directory..."
 # The Claude user's workspace, owned by them (not root) so Claude can work here.
+# /project belongs to the user, so root never writes into it directly (a
+# symlink planted there would redirect the write): CLAUDE.md is built in a
+# root-private temp file, filled in, then installed by the user.
 mkdir -p /project
-cat > /project/CLAUDE.md << 'CLAUDEMD'
+[ ! -L /project ] || { echo "!!! /project is a symlink; refusing to write through it"; exit 1; }
+chown "$AGENTIC_PRIMARY:$AGENTIC_PRIMARY" /project
+chmod 755 /project
+CLAUDEMD_TMP="$(mktemp)"
+cat > "$CLAUDEMD_TMP" << 'CLAUDEMD'
 # Claude Code Workspace
 
 ## Environment
-- **Machine**: a desktop PC running __OS__ natively (no VM or container around Claude)
+- **Machine**: a PC or a Proxmox VM running __OS__, with Claude installed straight onto the OS (no container around it)
 - **Working directory**: /project
 - **Timezone**: __TZ__
 - **User**: __USERS__ — a normal (non-root) account. Claude Code runs only as this
@@ -1217,10 +1391,13 @@ to confirm what's active.
   browser testing for UI verification and debugging
 CLAUDEMD
 sed -i -e "s/__USERS__/${AGENTIC_USERS}/" -e "s/__PRIMARY__/${AGENTIC_PRIMARY}/g" \
-       -e "s|__OS__|${AGENTIC_OS}|" -e "s|__TZ__|${AGENTIC_TZ}|" /project/CLAUDE.md
+       -e "s|__OS__|${AGENTIC_OS}|" -e "s|__TZ__|${AGENTIC_TZ}|" "$CLAUDEMD_TMP"
+chmod 644 "$CLAUDEMD_TMP"
+(cd / && runuser -u "$AGENTIC_PRIMARY" -- install -m 644 "$CLAUDEMD_TMP" /project/CLAUDE.md)
+rm -f "$CLAUDEMD_TMP"
+# Hand back anything under /project an older run created as root (chown -R
+# never follows symlinks).
 chown -R "$AGENTIC_PRIMARY:$AGENTIC_PRIMARY" /project
-chmod 755 /project
-chmod 644 /project/CLAUDE.md
 
 echo ">>> Configuring SSH..."
 # Ubuntu's sshd_config Includes /etc/ssh/sshd_config.d/*.conf from the TOP of the
@@ -1228,9 +1405,22 @@ echo ">>> Configuring SSH..."
 # with PasswordAuthentication no) silently outranks any edit to the main file.
 # Own a drop-in that sorts first instead, and keep the main-file edit for images
 # that predate the Include.
-# Root and the user may both log in with a password (or a key). MaxAuthTries
-# caps guesses per connection.
-sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
+# The user logs in with a password or a key. Root: key only (prohibit-password)
+# unless "password" was chosen at the prompt. MaxAuthTries caps guesses per
+# connection.
+if [ "${AGENTIC_ROOT_SSH:-key}" = password ]; then ROOT_LOGIN=yes; else ROOT_LOGIN=prohibit-password; fi
+# Save the main file's original two lines on the first run only (re-runs
+# would save our own edits; a box deployed by an older version, which already
+# has our drop-in, is skipped for the same reason), so --uninstall can put
+# them back as they were.
+if [ ! -f /etc/agentic/sshd-original ] && [ ! -f /etc/ssh/sshd_config.d/00-agentic.conf ] \
+   && [ -f /etc/ssh/sshd_config ]; then
+  mkdir -p /etc/agentic
+  { grep -m1 -E '^#*PermitRootLogin' /etc/ssh/sshd_config || true
+    grep -m1 -E '^#*PasswordAuthentication' /etc/ssh/sshd_config || true
+  } > /etc/agentic/sshd-original
+fi
+sed -i "s/^#*PermitRootLogin.*/PermitRootLogin $ROOT_LOGIN/" /etc/ssh/sshd_config
 sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
 # Claude Desktop's SSH sessions copy files over SFTP; Ubuntu ships the line, but
 # make sure it's there.
@@ -1238,10 +1428,11 @@ grep -qE '^[[:space:]]*Subsystem[[:space:]]+sftp' /etc/ssh/sshd_config \
   || echo 'Subsystem sftp /usr/lib/openssh/sftp-server' >> /etc/ssh/sshd_config
 if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
   mkdir -p /etc/ssh/sshd_config.d
-  cat > /etc/ssh/sshd_config.d/00-agentic.conf <<'SSHD'
-# Managed by the Claude Code Lubuntu deployer. Sorts before any other drop-in, and sshd keeps the first
-# value it sees, so these win over cloud-init's defaults.
-PermitRootLogin yes
+  cat > /etc/ssh/sshd_config.d/00-agentic.conf <<SSHD
+# Managed by the Claude Code Lubuntu deployer. Sorts before any other drop-in,
+# and sshd keeps the first value it sees, so these win over cloud-init's defaults.
+# root SSH: ${AGENTIC_ROOT_SSH:-key} (chosen at deploy; re-run the deployer to change it)
+PermitRootLogin $ROOT_LOGIN
 PasswordAuthentication yes
 MaxAuthTries 4
 SSHD
@@ -1298,10 +1489,11 @@ echo ">>> Installing agentic-setup-user (Claude Code setup for the user)..."
 cat > /usr/local/bin/agentic-setup-user << 'ADDUSER'
 #!/usr/bin/env bash
 # agentic-setup-user [name] — set up (or repair) the box's one Claude user:
-# sudo (and, with Claude Desktop, kvm) groups, their own Claude Code install, the shared settings/
-# plugins/skills, shell block, npm and git defaults. Safe to re-run: an existing
-# ~/.claude/settings.json and ~/.bashrc block are kept. Single-user by design —
-# it refuses a second user; use another machine (or the Proxmox deployer) for another person.
+# sudo (and, with Claude Desktop, kvm) groups, their own Claude Code install,
+# the shared settings/ plugins/skills, shell block, npm and git defaults. Safe
+# to re-run: an existing ~/.claude/settings.json and ~/.bashrc block are kept.
+# Single-user by design — it refuses a second user; use another machine (or
+# the Proxmox deployer) for another person.
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
 SHARE=/usr/local/share/agentic
@@ -1343,10 +1535,11 @@ as_user() {
 echo ">>> [$u] npm config..."
 # prefix: `npm i -g` as this user lands in ~/.local (already on PATH) instead of
 # failing on the root-owned /usr/lib/node_modules. The install-script allowlist
-# (npm 12+) is per user too — CloudCLI's in-app plugin installs run as this
-# user and need it.
+# (npm 12+) is per user too, and gets the same four CloudCLI native modules as
+# root's; anything else asks first (`npm approve-scripts` in that project).
 as_user npm config set prefix "$h/.local"
-as_user npm config set dangerously-allow-all-scripts true 2>/dev/null || true
+as_user npm config delete dangerously-allow-all-scripts 2>/dev/null || true
+as_user npm config set allow-scripts="@cloudcli-ai/cloudcli,bcrypt,better-sqlite3,node-pty" 2>/dev/null || true
 
 echo ">>> [$u] Installing Claude Code (native installer)..."
 CLAUDE_BIN="$h/.local/bin/claude"
@@ -1364,25 +1557,44 @@ else
 fi
 echo "    Claude Code installed: $(as_user "$CLAUDE_BIN" --version 2>/dev/null || echo 'version unknown')"
 
+# Everything in the user's home is written AS the user (as_user), never by
+# root: a symlink the user (or an agent running as them) planted there would
+# otherwise redirect a root write — ~/.claude -> /etc would hand them /etc.
+# The chown -R first takes back anything an older version created as root;
+# it never follows symlinks.
 # ~/.claude is private (it holds the login). The shared settings template is
 # copied only when the user has no settings.json yet, so yours is never
-# overwritten by a re-run.
-install -d -m 700 -o "$u" -g "$u" "$h/.claude"
-install -d -o "$u" -g "$u" "$h/.claude/skills"
-if [ ! -e "$h/.claude/settings.json" ]; then
-  install -m 644 -o "$u" -g "$u" "$SHARE/claude-settings.json" "$h/.claude/settings.json"
-fi
+# overwritten by a re-run. An existing one only gains the template's deny rules
+# it doesn't have yet (new secret paths added to this script); everything else
+# in it is left alone. (So a template deny rule you deleted comes back on the
+# next run; deny always beats allow, so edit the template above to drop one.)
+if [ -e "$h/.claude" ]; then chown -R "$u:$u" "$h/.claude"; fi
+as_user install -d -m 700 "$h/.claude"
+as_user install -d "$h/.claude/skills"
+as_user sh -c '[ -e "$1" ] || install -m 644 "$2" "$1"' sh "$h/.claude/settings.json" "$SHARE/claude-settings.json"
+# jq: append each template deny rule that's missing, keeping the file's order.
+# Written only if something changed and the result is valid; a settings.json
+# jq can't parse is left as it is.
+DENY_MERGE='(.permissions.deny // []) as $d | .permissions.deny = $d + [$t[0].permissions.deny[] | select(. as $x | $d | index($x) | not)]'
+as_user bash -c 'f="$1"; [ -f "$f" ] && [ ! -L "$f" ] || exit 0
+  n="$(mktemp "$f.XXXXXX")" || exit 0
+  if jq --slurpfile t "$2" "$3" "$f" > "$n" 2>/dev/null \
+     && [ "$(jq ".permissions.deny | length" "$n")" != "$(jq ".permissions.deny | length" "$f")" ]; then
+    chmod 644 "$n" && mv "$n" "$f" && echo "    added new deny rules to settings.json"
+  else
+    rm -f "$n"
+  fi' sh "$h/.claude/settings.json" "$SHARE/claude-settings.json" "$DENY_MERGE"
 
 echo ">>> [$u] Adding plugin marketplaces..."
 # The official marketplace is auto-registered on first INTERACTIVE launch only,
-# so a non-interactive provisioning run must add it explicitly. We use ONLY the
-# first-party marketplace now — the old 'anthropics/claude-code' demo repo
-# (registers as 'claude-code-plugins') ships same-named example copies that
-# shadow the official ones, and boxes were silently landing on those.
+# so a non-interactive provisioning run must add it explicitly. Only the
+# first-party marketplace is used: the 'anthropics/claude-code' demo repo
+# (it registers as 'claude-code-plugins') ships example plugins with the same
+# names, which would shadow the official ones.
 as_user "$CLAUDE_BIN" plugin marketplace add anthropics/claude-plugins-official \
   || echo "    [WARN] could not add claude-plugins-official"
-# Refresh the index BEFORE installing — a stale cache makes name@official
-# silently fall through, which is how boxes ended up on demo copies.
+# Refresh the index BEFORE installing: with a stale cache, name@official can
+# quietly fail to resolve.
 as_user "$CLAUDE_BIN" plugin marketplace update claude-plugins-official \
   || echo "    [WARN] could not update claude-plugins-official index"
 # Third-party marketplace for Superpowers.
@@ -1440,12 +1652,10 @@ as_user "$CLAUDE_BIN" plugin list 2>/dev/null || echo "    (plugin list unavaila
 # The webapp-testing skill (copied once), the shell block (appended once; its
 # header line is the marker that prevents duplicates) and git defaults.
 echo ">>> [$u] Skills, shell and git defaults..."
-if [ -d "$SHARE/skills/webapp-testing" ] && [ ! -e "$h/.claude/skills/webapp-testing" ]; then
-  cp -r "$SHARE/skills/webapp-testing" "$h/.claude/skills/webapp-testing"
+if [ -d "$SHARE/skills/webapp-testing" ]; then
+  as_user sh -c '[ -e "$1" ] || cp -r "$2" "$1"' sh "$h/.claude/skills/webapp-testing" "$SHARE/skills/webapp-testing"
 fi
-grep -q '── Claude Code Lubuntu ──' "$h/.bashrc" 2>/dev/null \
-  || cat "$SHARE/bashrc" >> "$h/.bashrc"
-chown -R "$u:$u" "$h/.claude" "$h/.bashrc"
+as_user sh -c 'grep -q "$1" "$2" 2>/dev/null || cat "$3" >> "$2"' sh '── Claude Code Lubuntu ──' "$h/.bashrc" "$SHARE/bashrc"
 as_user git config --global init.defaultBranch main
 as_user git config --global core.editor nano
 as_user git config --global pull.rebase false
@@ -1520,7 +1730,7 @@ if [ -d "$CCUI_PKG/node_modules/better-sqlite3" ] && ! ls "$CCUI_PKG/node_module
   ( cd "$CCUI_PKG" && npm rebuild >/dev/null 2>&1 ) || echo "    [WARN] CloudCLI native rebuild failed"
 fi
 CCUI_BIN="$(command -v cloudcli || echo /usr/bin/cloudcli)"
-install -d -m 700 -o "$AGENTIC_PRIMARY" -g "$AGENTIC_PRIMARY" "$PRIMARY_HOME/.cloudcli"
+(cd / && runuser -u "$AGENTIC_PRIMARY" -- install -d -m 700 "$PRIMARY_HOME/.cloudcli")
 echo "    CloudCLI UI installed: $("$CCUI_BIN" version 2>/dev/null || echo 'version unknown')"
 
 # Browser feature runtime. CloudCLI detects Playwright via require('playwright')
@@ -1530,15 +1740,18 @@ echo "    CloudCLI UI installed: $("$CCUI_BIN" version 2>/dev/null || echo 'vers
 # Chromium build is shared with the Python install above (/opt/ms-playwright),
 # so this only downloads if that step failed.
 echo ">>> Installing Playwright runtime for CloudCLI Browser feature..."
-npm install -g "${NPM_QUIET[@]}" playwright \
+npm ls -g --depth=0 playwright >/dev/null 2>&1 \
+  || npm install -g "${NPM_QUIET[@]}" playwright \
   || echo "    [WARN] global Playwright install failed (CloudCLI Browser feature won't work)"
-ls -d /opt/ms-playwright/chromium-* >/dev/null 2>&1 \
-  || playwright install chromium \
+# The build this Playwright version wants (a no-op when it's already there),
+# into the root-owned browser cache.
+install -d -m 755 /opt/ms-playwright
+PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install chromium \
   || echo "    [WARN] Chromium download failed; retry later with: sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install chromium"
-# Browser cache owned by the Claude user, so their own Playwright (a pip --user
-# or project install wanting a different browser build) can add to it.
+# The browser cache stays root's and readable by everyone. A project that pins
+# a different Playwright version can keep its own browsers in the user's home:
+# PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright npx playwright install.
 if [ -d /opt/ms-playwright ]; then
-  chown -R "$AGENTIC_PRIMARY:$AGENTIC_PRIMARY" /opt/ms-playwright
   chmod -R a+rX /opt/ms-playwright
 fi
 
@@ -1559,9 +1772,10 @@ Environment=NODE_ENV=production
 # succeed.
 Environment=NPM_CONFIG_INCLUDE=dev
 Environment=HOME=${PRIMARY_HOME}
-# Listen on every interface (LAN access) on :3001; drive this user's claude
-# and keep the web UI's own login database in their home.
-Environment=HOST=0.0.0.0
+# Listen on :3001, on localhost only (reach it through an SSH tunnel) unless
+# LAN access was chosen at deploy; drive this user's claude and keep the web
+# UI's own login database in their home.
+Environment=HOST=${AGENTIC_WEBUI_BIND:-127.0.0.1}
 Environment=SERVER_PORT=3001
 Environment=CLAUDE_CLI_PATH=${PRIMARY_CLAUDE}
 Environment=DATABASE_PATH=${PRIMARY_HOME}/.cloudcli/auth.db
@@ -1577,11 +1791,10 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# Load the new unit, start it at every boot, and start it now.
+# Load the new unit and start it at every boot. It's started at the very end,
+# once the user's Claude setup, tools and permissions are all in place.
 systemctl daemon-reload
 systemctl enable cloudcli >/dev/null 2>&1 || true
-systemctl start cloudcli \
-  || echo "    [WARN] cloudcli service failed to start; check 'journalctl -u cloudcli'"
 
 if [ "$AGENTIC_DESKTOP" = yes ]; then
   echo ">>> Installing Claude Desktop with Cowork (Linux beta)..."
@@ -1649,8 +1862,8 @@ if [ "$AGENTIC_DESKTOP" = yes ]; then
     apt-get install -y -qq "${CD_EXTRA[@]}" \
       || echo "    [WARN] Cowork's QEMU/KVM packages failed to install"
   fi
-  # Only a warning — nothing is installed here. Either session folder counts
-  # (see the same check in the deployer's prompts for why it isn't `ls`).
+  # Only a warning; nothing is installed here. Either session folder counts,
+  # as in the same check in the deployer's prompts.
   # No session file in either folder = no graphical desktop (warning only).
   if ! compgen -G '/usr/share/wayland-sessions/*.desktop' >/dev/null \
      && ! compgen -G '/usr/share/xsessions/*.desktop' >/dev/null; then
@@ -1706,14 +1919,17 @@ MODULES
 fi
 
 echo ">>> Installing coordinated update tooling (agentic-update / agentic-doctor / agentic-errorlog)..."
-# Single coordinated update pass, modeled on homelabhero's hh-update + hh doctor:
-# OS packages -> Rust toolchain -> the user's Claude Code -> CloudCLI
-# UI -> restart UI -> health
-# check -> log. Both tools run as root (they re-exec through sudo for the user)
-# and read the user from /etc/agentic/users.conf. Re-runnable on demand
-# ('agentic-update'), no reinstall required. Everything tracks latest
-# (unpinned); the post-update health check is the safety net, and results land
-# in /var/log/agentic-update.log.
+# Three tools, written below:
+#   agentic-errorlog  files WARN/FAIL lines in Agentic-Errors.txt (+ optional ntfy)
+#   agentic-doctor    the health check
+#   agentic-update    one coordinated update pass, in this order: OS packages ->
+#                     npm and the global dev tools (Playwright, gopls) -> Rust ->
+#                     the user's Claude Code -> the CloudCLI web UI (restarted)
+#                     -> agentic-doctor -> problems filed by agentic-errorlog.
+# Modeled on homelabhero's hh-update + hh doctor. They run as root, act on the
+# user named in /etc/agentic/users.conf, and can be run by hand at any time.
+# Everything tracks the latest release (nothing pinned); the health check at
+# the end is the safety net. The log is /var/log/agentic-update.log.
 
 cat > /usr/local/bin/agentic-errorlog << 'ERRLOG'
 #!/usr/bin/env bash
@@ -1888,6 +2104,10 @@ for u in $AGENTIC_USERS; do
   check "$u: claude binary present"       "test -x '$cb'"
   check "$u: claude reports a version"    "(cd '$h' && runuser -u '$u' -- env -i HOME='$h' PATH=/usr/local/bin:/usr/bin:/bin '$cb' --version)"
   check "$u: settings.json is valid JSON" "python3 -m json.tool '$h/.claude/settings.json'"
+  # sudo -l -U lists every rule that applies to the user (their own, group
+  # rules like %sudo, any file); NOPASSWD or !authenticate there means an
+  # auto-mode agent could become root without the password.
+  note  "$u: sudo asks for a password (no NOPASSWD rule)" "! sudo -l -U '$u' 2>/dev/null | grep -qE 'NOPASSWD|!authenticate'"
   note  "$u: claude logged in (creds on disk; run 'claude' /login as $u if WARN)" "test -s '$h/.claude/.credentials.json'"
 done
 # Shared toolchains and services.
@@ -1899,7 +2119,6 @@ check "UI listening on :3001"       "ss -ltn | grep -q ':3001'"
 # Claude Desktop + Cowork (only when they were installed). The packages, group
 # and module are this box's own setup (check = FAIL when broken); hardware
 # virtualization and the live device nodes depend on firmware/reboots (note).
-# Claude Desktop plus everything Cowork's VM needs (only when it was installed).
 if [ "$AGENTIC_DESKTOP" = yes ]; then
   check "Claude Desktop installed"    "dpkg -s claude-desktop"
   check "Cowork: QEMU present"        "command -v qemu-system-x86_64 || command -v qemu-system-aarch64"
@@ -1965,32 +2184,66 @@ echo ">>> [1/6] OS packages (Node.js patches within its LTS line, gh, Claude Des
 apt-get update -qq && apt-get full-upgrade -y -qq && apt-get autoremove -y -qq && apt-get clean -qq \
   || echo "    [WARN] OS package update failed"
 
-echo ">>> [2/6] npm (latest)..."
-npm install -g --no-fund --no-audit --loglevel=error npm@latest || echo "    [WARN] npm self-update failed"
-# npm 12+ blocks dependencies' install scripts behind an allowlist (separate
-# from ignore-scripts), so CloudCLI's native deps (better-sqlite3/node-pty/
-# bcrypt) never compile -> cloudcli crash-loops and nothing binds :3001. Boxes
-# deploy on npm 10 (builds fine) but this weekly run upgrades npm above, so the
-# config MUST be set here -- AFTER npm@latest lands (it only persists to
-# /root/.npmrc under npm 12+) and BEFORE the cloudcli reinstall/rebuild below.
-# The user gets it too: CloudCLI's in-app plugin installs run as them.
-npm config set dangerously-allow-all-scripts true 2>/dev/null || true
+echo ">>> [2/6] npm + global dev tools (incl. Playwright) + gopls..."
+npm install -g --no-fund --no-audit --loglevel=error --ignore-scripts npm@latest || echo "    [WARN] npm self-update failed"
+# npm 12+ only runs install scripts for packages on an allowlist. Allow just
+# CloudCLI's native modules (better-sqlite3, node-pty, bcrypt), which must
+# compile or cloudcli crash-loops with nothing on :3001. Set again on every run
+# (after npm@latest, in case npm just reached 12, and before the CloudCLI step
+# below), and an older allow-everything setting is removed. The users get the
+# same list: CloudCLI's in-app plugin installs run as them.
+NPM_ALLOW_SCRIPTS="@cloudcli-ai/cloudcli,bcrypt,better-sqlite3,node-pty"
+npm config delete dangerously-allow-all-scripts 2>/dev/null || true
+npm config set allow-scripts="$NPM_ALLOW_SCRIPTS" 2>/dev/null || true
 for u in $AGENTIC_USERS; do
-  as_user "$u" npm config set dangerously-allow-all-scripts true >/dev/null 2>&1 || true
+  as_user "$u" npm config delete dangerously-allow-all-scripts >/dev/null 2>&1 || true
+  as_user "$u" npm config set allow-scripts="$NPM_ALLOW_SCRIPTS" >/dev/null 2>&1 || true
 done
 # The global dev tools and npm-based language servers the deployer installed
 # (re-running the deployer skips them, so they're kept current here). Only the
 # ones still installed are touched; CloudCLI has its own step below.
 # Builds a <pkg>@latest list of the tools that are still installed, so one
-# npm call updates them all; a tool you uninstalled is not brought back.
+# npm call updates them all; a tool you uninstalled is not brought back. None
+# of them needs an install script, so they run with --ignore-scripts: root
+# runs this unattended every week, and that keeps a compromised release of any
+# package in their trees from running code at install time.
 NPM_TOOLS=()
-for pkg in typescript ts-node eslint prettier typescript-language-server pyright; do
+for pkg in typescript ts-node eslint prettier typescript-language-server pyright playwright; do
   npm ls -g --depth=0 "$pkg" >/dev/null 2>&1 && NPM_TOOLS+=("${pkg}@latest")
 done
 if [ ${#NPM_TOOLS[@]} -gt 0 ]; then
-  npm install -g --no-fund --no-audit --loglevel=error "${NPM_TOOLS[@]}" \
+  npm install -g --no-fund --no-audit --loglevel=error --ignore-scripts "${NPM_TOOLS[@]}" \
     && echo "    updated: ${NPM_TOOLS[*]}" \
     || echo "    [WARN] global dev tool update failed"
+fi
+# Playwright: the pip package follows the npm one to its latest release, then
+# the Chromium build each one wants is fetched into the root-owned cache. A
+# cache an older deploy gave to the Claude user is deleted and downloaded again
+# rather than written into, so nothing planted there can redirect a root write.
+if python3 -c 'import playwright' >/dev/null 2>&1; then
+  pip install -U -q --break-system-packages --root-user-action=ignore playwright \
+    || echo "    [WARN] pip playwright update failed"
+fi
+if [ -d /opt/ms-playwright ] && find /opt/ms-playwright ! -user root -print -quit | grep -q .; then
+  rm -rf /opt/ms-playwright && install -d -m 755 /opt/ms-playwright
+fi
+pw_chromium() {  # pw_chromium <playwright command...>: fetch the Chromium it wants
+  PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright "$@" install chromium
+}
+if [ -d /opt/ms-playwright ]; then
+  if command -v playwright >/dev/null 2>&1; then
+    pw_chromium playwright >/dev/null || echo "    [WARN] Chromium download for the npm Playwright failed"
+  fi
+  if python3 -c 'import playwright' >/dev/null 2>&1; then
+    pw_chromium python3 -m playwright >/dev/null || echo "    [WARN] Chromium download for the Python Playwright failed"
+  fi
+  chmod -R a+rX /opt/ms-playwright
+fi
+# gopls, the Go language server behind the gopls-lsp plugin (only when the
+# deployer installed it).
+if [ -x /usr/local/bin/gopls ] && [ -x /usr/local/go/bin/go ]; then
+  GOBIN=/usr/local/bin /usr/local/go/bin/go install golang.org/x/tools/gopls@latest \
+    && echo "    gopls updated" || echo "    [WARN] gopls update failed"
 fi
 
 echo ">>> [3/6] Rust (shared toolchain in /opt/rust)..."
@@ -2043,9 +2296,6 @@ else
 fi
 # Copy this run's [WARN]/FAIL lines, each tagged with its step, to the user's
 # Agentic-Errors.txt (agentic-errorlog). A clean run writes nothing.
-# tail -c +N starts at byte N (1-based), i.e. just after where this run
-# began. The awk remembers the current '[n/6]' step header and prints each
-# [WARN] line (and agentic-doctor's WARN/FAIL lines) prefixed with that step.
 # awk keeps the current ">>> [n/N]" step header in mind and prints every
 # [WARN] / WARN / FAIL line prefixed with that step.
 PROBLEMS="$(tail -c +"$((LOG_START + 1))" "$LOG" | awk '
@@ -2062,7 +2312,7 @@ chmod +x /usr/local/bin/agentic-update
 # "0 4 * * 0" = 04:00 every Sunday, run as root.
 cat > /etc/cron.d/agentic-update << 'CRON'
 # Weekly coordinated update - Sunday 4:00 AM (this machine's local time)
-# (OS incl. Claude Desktop + Rust + Claude Code + CloudCLI UI,
+# (OS incl. Claude Desktop, npm tools, Rust, Claude Code, CloudCLI UI,
 #  then a health check)
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -2081,8 +2331,15 @@ cat > /etc/logrotate.d/agentic-update << 'LOGROTATE'
 }
 LOGROTATE
 
-# Remove packages nothing depends on any more, and apt's downloaded .deb cache.
+# Start (or restart) the web UI last, now that everything it drives is ready.
+if [ -f /etc/systemd/system/cloudcli.service ]; then
+  echo ">>> Starting the web UI..."
+  systemctl restart cloudcli \
+    || echo "    [WARN] cloudcli service failed to start; check 'journalctl -u cloudcli'"
+fi
+
 echo ">>> Cleaning up..."
+# Remove packages nothing depends on any more, and apt's downloaded .deb cache.
 apt-get autoremove -y -qq
 apt-get clean -qq
 # Unlike the LXC, the package lists stay: this is a full machine, and the
@@ -2110,6 +2367,8 @@ PROVISION_EOF
       printf 'AGENTIC_NTFY_TOPIC=%q\n' "$CT_NTFY_TOPIC"
       printf 'AGENTIC_NTFY_SERVER=%q\n' "$CT_NTFY_SERVER"
       printf 'AGENTIC_NTFY_TOKEN=%q\n' "$CT_NTFY_TOKEN"
+      printf 'AGENTIC_WEBUI_BIND=%q\n' "$CT_WEBUI_BIND"
+      printf 'AGENTIC_ROOT_SSH=%q\n' "$CT_ROOT_SSH"
       printf 'AGENTIC_TZ=%q\n' "$CT_TZ"
       printf 'AGENTIC_DESKTOP=%q\n' "$CT_DESKTOP"
       printf 'AGENTIC_FIX_NOPASSWD=%q\n' "$CT_FIX_NOPASSWD"
@@ -2148,7 +2407,7 @@ write_notes() {
   notes=$(cat <<'EOF'
 # 🤖 Claude Code on Lubuntu (__HOST__)
 
-**Web UI (CloudCLI UI):** http://__IP__:3001 — _create a login on first visit_
+__WEBUI_LINE__
 **SSH:** `ssh __USER__@__IP__` (or `ssh __USER__@__HOST__.local`)   |   **Console:** log in as root, then `su - __USER__`
 
 ## Start Claude Code
@@ -2159,7 +2418,7 @@ Log in as __USER__, then run `claude` (the shell auto-cd's to `/project`).
 __DESKTOP__
 
 ## Update & health
-- `sudo agentic-update` — one coordinated pass: OS (incl. Claude Desktop, QEMU) → Rust → Claude Code → Web UI → health check
+- `sudo agentic-update` — one coordinated pass: OS (incl. Claude Desktop, QEMU) → npm tools → Rust → Claude Code → Web UI → health check
 - `sudo agentic-doctor` — the health check on its own (also Cowork's KVM/QEMU/vsock requirements)
 - Auto-runs weekly (Sunday 4 AM, __TZ__). Log: `/var/log/agentic-update.log`
 - Any WARN/FAIL from either is also appended to `Agentic-Errors.txt` on __USER__'s desktop (home folder if there is none); delete it once dealt with
@@ -2185,6 +2444,14 @@ EOF
     desk="Not installed. Re-run this script and answer Y to add Claude Desktop with Cowork, or see code.claude.com/docs/en/desktop-linux."
   fi
   # Fill in the placeholders.
+  # Web UI line: a direct link if it's open to the LAN, else the SSH tunnel.
+  local webline
+  if [[ "$CT_WEBUI_BIND" == 0.0.0.0 ]]; then
+    webline="**Web UI (CloudCLI UI):** http://__IP__:3001 (open to the LAN) — _create a login on first visit_"
+  else
+    webline="**Web UI (CloudCLI UI):** this machine only. From your computer: \`ssh -L 3001:localhost:3001 __USER__@__IP__\`, then open http://localhost:3001 — _create a login on first visit_"
+  fi
+  notes=${notes//__WEBUI_LINE__/$webline}
   notes=${notes//__IP__/$ip}
   notes=${notes//__HOST__/$CT_HOSTNAME}
   notes=${notes//__USER__/$CT_PRIMARY_USER}
@@ -2197,7 +2464,8 @@ EOF
   h=$(getent passwd "$CT_PRIMARY_USER" | cut -d: -f6)
   if printf '%s\n' "$notes" > /etc/agentic/README.md; then
     chmod 644 /etc/agentic/README.md
-    install -m 644 -o "$CT_PRIMARY_USER" -g "$CT_PRIMARY_USER" /etc/agentic/README.md "$h/CLAUDE-BOX.md" 2>/dev/null || true
+    # Copied by the user, not root, so a symlink in their home can't redirect it.
+    (cd / && runuser -u "$CT_PRIMARY_USER" -- install -m 644 /etc/agentic/README.md "$h/CLAUDE-BOX.md") 2>/dev/null || true
     success "Wrote the notes card to /etc/agentic/README.md (copy: ~$CT_PRIMARY_USER/CLAUDE-BOX.md)."
   else
     warn "Could not write the notes card (non-fatal)."
@@ -2220,11 +2488,15 @@ print_summary() {
   echo -e "  ${BOLD}Resources:${NC} ${HOST_CPUS} CPU / ${HOST_RAM_MB} MB RAM / $(df -h --output=avail / | tail -1 | tr -d ' ') free"
   echo -e "  ${BOLD}Timezone:${NC}  $CT_TZ"
   echo -e "  ${BOLD}User:${NC}      $CT_USER (Claude runs only as this user; sudo: $CT_USER_SUDO)"
-  echo -e "  ${BOLD}Security:${NC}  SSH for root + $CT_USER (password$([[ -n "$CT_SSH_KEY" ]] && echo ' or key'))$([[ $CT_FIX_NOPASSWD == yes ]] && echo '; sudo now asks for a password')"
+  echo -e "  ${BOLD}Security:${NC}  SSH for $CT_USER (password$([[ -n "$CT_SSH_KEY" ]] && echo ' or key')) and root ($([[ $CT_ROOT_SSH == key ]] && echo 'key only' || echo 'password or key'))$([[ $CT_FIX_NOPASSWD == yes ]] && echo '; sudo now asks for a password')"
   echo ""
   echo -e "  ${BOLD}Connect:${NC}"
   [[ -n "${ip:-}" ]] && echo -e "    SSH:     ${CYAN}ssh ${CT_USER}@${ip}${NC}  (or ${CYAN}ssh ${CT_USER}@${CT_HOSTNAME}.local${NC})"
-  [[ -n "${ip:-}" ]] && echo -e "    Web UI:  ${CYAN}http://${ip}:3001${NC} (as $CT_USER — ${YELLOW}create its login NOW${NC}; the first visitor claims it)"
+  if [[ -n "${ip:-}" ]] && [[ "$CT_WEBUI_BIND" == 0.0.0.0 ]]; then
+    echo -e "    Web UI:  ${CYAN}http://${ip}:3001${NC} (as $CT_USER — ${YELLOW}create its login NOW${NC}; the first visitor claims it)"
+  elif [[ -n "${ip:-}" ]]; then
+    echo -e "    Web UI:  ${CYAN}ssh -L 3001:localhost:3001 ${CT_USER}@${ip}${NC}, then ${CYAN}http://localhost:3001${NC} (local only — ${YELLOW}create its login NOW${NC})"
+  fi
   echo ""
   echo -e "  ${BOLD}Start Claude Code:${NC} (as a normal user, not root)"
   echo -e "    ${CYAN}claude${NC}  (shell auto-cd's to /project on login; as root: ${CYAN}su - $CT_USER${NC})"
@@ -2298,10 +2570,221 @@ offer_reboot() {
   fi
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────
+# ── Uninstall ───────────────────────────────────────────────────────────────
+# `sudo bash Claude_Code_Lubuntu_Deployer.sh --uninstall` takes back what this
+# script set up. It asks first, shows the plan, and only starts after you type
+# "uninstall". Always removed: the web UI, the agentic-* tools, the weekly
+# update, the settings and drop-ins under /etc and /usr/local the script wrote,
+# and its shell block; sshd_config's two edited lines go back to how they were
+# before the first deploy. Asked about: the dev toolchains, the apt software it
+# added, and the Claude user's own Claude data. Never touched: the user account
+# and its password, root's password, /project, the hostname, timezone and
+# locale, the sudoers edits (their backups are in /root/*.agentic-bak), and the
+# base packages (git, curl, build tools, Python, the SSH server...) that other
+# software may rely on.
+uninstall_yes() {   # uninstall_yes "<question>" <default y|n>
+  local ans
+  if [[ "$2" == y ]]; then read -rp "$1 [Y/n]: " ans; [[ ! "$ans" =~ ^[Nn] ]]
+  else read -rp "$1 [y/N]: " ans; [[ "$ans" =~ ^[Yy] ]]; fi
+}
+
+uninstall() {
+  [[ $(id -u) -eq 0 ]] || error "Run the uninstall as root: sudo bash $0 --uninstall"
+  # shellcheck disable=SC2034  # AGENTIC_PRIMARY is set by users.conf; local keeps it here
+  local AGENTIC_USERS="" AGENTIC_PRIMARY="" u h ans
+  # shellcheck disable=SC1091
+  [[ -r /etc/agentic/users.conf ]] && source /etc/agentic/users.conf
+  if [[ -z "$AGENTIC_USERS" ]]; then
+    warn "/etc/agentic/users.conf is missing, so the Claude user isn't known."
+    read -rp "Claude user to clean up (Enter for none): " AGENTIC_USERS
+    AGENTIC_USERS="${AGENTIC_USERS// /}"
+    [[ -z "$AGENTIC_USERS" ]] || id "$AGENTIC_USERS" >/dev/null 2>&1 || error "No such user: $AGENTIC_USERS"
+  fi
+  echo ""
+  echo -e "${BOLD}Uninstall${NC}: removes what this script set up${AGENTIC_USERS:+ for $AGENTIC_USERS}."
+  echo "Always removed: the web UI (CloudCLI), agentic-update/-doctor/-setup-user/-errorlog,"
+  echo "the weekly update, /etc/agentic, /usr/local/share/agentic, the root 'claude' stub, the"
+  echo "SSH and apt drop-ins, the shell block in .bashrc and the npm install-script setting."
+  echo ""
+  local RM_TOOLS=no RM_APT=no RM_DATA=no
+  uninstall_yes "Remove the dev toolchains it installed (Go, Rust, gopls, rust-analyzer, the global npm tools, Playwright and its browsers)?" y && RM_TOOLS=yes
+  uninstall_yes "Remove the apt software it added (Node.js and the NodeSource repo, gh and its repo, Claude Desktop and its repo, clangd, and Cowork's QEMU/KVM stack)? Other software you installed may use them." n && RM_APT=yes
+  if [[ -n "$AGENTIC_USERS" ]]; then
+    uninstall_yes "Delete $AGENTIC_USERS's Claude Code data (~/.claude, ~/.claude.json, the claude install, ~/.cloudcli, the notes card, Agentic-Errors.txt)? This signs Claude out and deletes its settings, plugins and history." n && RM_DATA=yes
+  fi
+  echo ""
+  echo "Kept: the user account, /project, root's password, hostname/timezone/locale, the"
+  echo "SSH server, base packages, group memberships (sudo/kvm) and the sudoers edits."
+  read -rp "Type 'uninstall' to go ahead (anything else cancels): " ans
+  [[ "$ans" == uninstall ]] || { info "Cancelled; nothing was changed."; exit 0; }
+
+  mkdir -p /var/log/agentic-deploy
+  local log
+  log="/var/log/agentic-deploy/uninstall-$(date +%Y%m%d-%H%M%S).log"
+  ( umask 077; : > "$log" )
+  exec > >(tee -a "$log") 2>&1
+  info "Logging the uninstall to $log"
+
+  # Runs a command as the Claude user, from /, so nothing in their home is
+  # touched by root (the same reason the installer writes there as them).
+  as_claude_user() { (cd / && runuser -u "$u" -- "$@"); }
+
+  echo ">>> Web UI and weekly update..."
+  systemctl disable --now cloudcli >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/cloudcli.service
+  systemctl daemon-reload || true
+  command -v npm >/dev/null 2>&1 && { npm uninstall -g --no-fund --no-audit --loglevel=error @cloudcli-ai/cloudcli || true; }
+  rm -f /etc/cron.d/agentic-update /etc/logrotate.d/agentic-update
+
+  echo ">>> Tools, settings and drop-ins..."
+  rm -f /usr/local/bin/agentic-setup-user /usr/local/bin/agentic-update \
+        /usr/local/bin/agentic-doctor /usr/local/bin/agentic-errorlog
+  # The root 'claude' stub, only if it's ours (it points root at the user).
+  if grep -qs 'not run as root on this box' /usr/local/bin/claude; then rm -f /usr/local/bin/claude; fi
+  # Read what the deploy saved before /etc/agentic goes: the main sshd_config's
+  # original PermitRootLogin / PasswordAuthentication lines (used further down).
+  # Boxes deployed before that file existed get the OS's commented defaults.
+  local ssh_orig_root="#PermitRootLogin prohibit-password" ssh_orig_pw="#PasswordAuthentication yes"
+  if [[ -f /etc/agentic/sshd-original ]]; then
+    ssh_orig_root="$(grep -m1 'PermitRootLogin' /etc/agentic/sshd-original || true)"
+    ssh_orig_pw="$(grep -m1 'PasswordAuthentication' /etc/agentic/sshd-original || true)"
+  fi
+  rm -rf /usr/local/share/agentic /etc/agentic
+  rm -f /etc/profile.d/agentic.sh /etc/apt/apt.conf.d/99agentic-lock-wait
+  [[ -f /etc/environment ]] && sed -i -E '/^RUSTUP_HOME=\/opt\/rust\/rustup$/d; /^PLAYWRIGHT_BROWSERS_PATH=\/opt\/ms-playwright$/d' /etc/environment
+  git config --system --unset-all safe.directory '^/project(/\*)?$' 2>/dev/null || true
+  # npm's install-script allowlist (root's; the user's is below).
+  command -v npm >/dev/null 2>&1 && { npm config delete allow-scripts 2>/dev/null || true; }
+  # SSH: drop our drop-in and put the main file's two lines back the way they
+  # were before the first deploy (read above). An empty saved line means the
+  # file never had one, so the deploy didn't touch it and neither do we.
+  # Values go in through the environment, not awk -v, so a backslash in them
+  # stays a backslash. Never restart into a config sshd rejects.
+  rm -f /etc/ssh/sshd_config.d/00-agentic.conf
+  if [[ -f /etc/ssh/sshd_config ]]; then
+    ROOT_LINE="$ssh_orig_root" PW_LINE="$ssh_orig_pw" awk '
+      /^PermitRootLogin /        && ENVIRON["ROOT_LINE"] != "" { print ENVIRON["ROOT_LINE"]; next }
+      /^PasswordAuthentication / && ENVIRON["PW_LINE"]   != "" { print ENVIRON["PW_LINE"];   next }
+      { print }' /etc/ssh/sshd_config > /etc/ssh/sshd_config.agentic-new \
+      && cat /etc/ssh/sshd_config.agentic-new > /etc/ssh/sshd_config
+    rm -f /etc/ssh/sshd_config.agentic-new
+  fi
+  if [[ ! -f /etc/ssh/sshd_config ]]; then
+    :
+  elif sshd -t 2>/dev/null || /usr/sbin/sshd -t 2>/dev/null; then
+    systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  else
+    warn "sshd's config test failed after the change; check /etc/ssh/sshd_config before the next restart"
+  fi
+  # The shell block, from root's .bashrc and (as them) the user's. The block
+  # runs from its marker line to its closing "cd /project" line. The first awk
+  # checks that both are there, in that order; if someone deleted the closing
+  # line, removing "to the end of the block" would also delete everything
+  # after it, so the file is left alone with a warning instead.
+  local uninstall_bashrc_check='index($0, m) { s=1 } s && $0 == "cd /project 2>/dev/null || true" { f=1 } END { exit !f }'
+  local uninstall_bashrc_awk='index($0, m) { skip=1; next } skip && $0 == "cd /project 2>/dev/null || true" { skip=0; next } !skip'
+  if grep -qs "── Claude Code Lubuntu ──" /root/.bashrc; then
+    if awk -v m="── Claude Code Lubuntu ──" "$uninstall_bashrc_check" /root/.bashrc; then
+      # cat > (not mv) keeps the file's owner and mode.
+      awk -v m="── Claude Code Lubuntu ──" "$uninstall_bashrc_awk" /root/.bashrc > /root/.bashrc.agentic-new \
+        && cat /root/.bashrc.agentic-new > /root/.bashrc
+      rm -f /root/.bashrc.agentic-new
+    else
+      warn "Left /root/.bashrc alone: its Claude Code block has no closing 'cd /project' line. Remove the block by hand."
+    fi
+  fi
+  for u in $AGENTIC_USERS; do
+    id "$u" >/dev/null 2>&1 || continue
+    h="$(getent passwd "$u" | cut -d: -f6)"
+    as_claude_user bash -c 'f="$1/.bashrc"; [ -f "$f" ] && [ ! -L "$f" ] && grep -q "$2" "$f" || exit 0
+      awk -v m="$2" "$4" "$f" || exit 1
+      awk -v m="$2" "$3" "$f" > "$f.agentic-new" && cat "$f.agentic-new" > "$f"; rm -f "$f.agentic-new"' \
+      sh "$h" "── Claude Code Lubuntu ──" "$uninstall_bashrc_awk" "$uninstall_bashrc_check" \
+      || warn "Left $h/.bashrc alone: its Claude Code block has no closing 'cd /project' line (or the file couldn't be written). Remove the block by hand."
+    as_claude_user npm config delete allow-scripts >/dev/null 2>&1 || true
+  done
+
+  if [[ "$RM_TOOLS" == yes ]]; then
+    echo ">>> Dev toolchains..."
+    if command -v npm >/dev/null 2>&1; then
+      npm uninstall -g --no-fund --no-audit --loglevel=error \
+        typescript ts-node eslint prettier typescript-language-server pyright playwright || true
+    fi
+    pip uninstall -y -q --break-system-packages --root-user-action=ignore playwright 2>/dev/null || true
+    rm -rf /opt/ms-playwright /usr/local/go /opt/rust
+    rm -f /etc/profile.d/go.sh /usr/local/bin/gopls
+    # rust-analyzer: only our symlink into the shared toolchain.
+    if [[ -L /usr/local/bin/rust-analyzer ]]; then rm -f /usr/local/bin/rust-analyzer; fi
+  fi
+
+  if [[ "$RM_APT" == yes ]]; then
+    echo ">>> apt software and repositories..."
+    local pkgs=() p
+    # The global npm tools can't run without Node, so they go first.
+    if command -v npm >/dev/null 2>&1; then
+      npm uninstall -g --no-fund --no-audit --loglevel=error \
+        typescript ts-node eslint prettier typescript-language-server pyright playwright || true
+    fi
+    for p in claude-desktop gh nodejs clangd qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 virtiofsd cpu-checker; do
+      dpkg -s "$p" >/dev/null 2>&1 && pkgs+=("$p")
+    done
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+      apt-get purge -y -qq "${pkgs[@]}" || warn "some packages didn't uninstall: ${pkgs[*]}"
+    fi
+    rm -f /etc/apt/sources.list.d/claude-desktop.list /etc/apt/sources.list.d/github-cli.list \
+          /etc/apt/sources.list.d/nodesource.* /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+          /etc/apt/keyrings/nodesource.gpg /usr/share/keyrings/claude-desktop-archive-keyring.asc \
+          /etc/apt/preferences.d/nodejs /etc/apt/preferences.d/nsolid /etc/modules-load.d/claude-cowork.conf
+    apt-get update -qq || true
+    apt-get autoremove -y -qq || true
+  fi
+
+  if [[ "$RM_DATA" == yes ]]; then
+    echo ">>> The Claude user's Claude data..."
+    for u in $AGENTIC_USERS; do
+      id "$u" >/dev/null 2>&1 || continue
+      h="$(getent passwd "$u" | cut -d: -f6)"
+      as_claude_user bash -c 'cd "$1" || exit 0
+        rm -rf .claude .claude.json .claude.json.backup .cloudcli .local/share/claude .local/bin/claude \
+               "$2" Agentic-Errors.txt Desktop/Agentic-Errors.txt' sh "$h" "CLAUDE-BOX.md" || true
+    done
+  fi
+
+  echo ""
+  success "Uninstall finished. Log: $log"
+  echo "  Left in place: the user account, /project, the SSH server, base packages and group memberships."
+  ls /root/*.agentic-bak >/dev/null 2>&1 \
+    && echo "  sudoers backups from the NOPASSWD fix: $(ls /root/*.agentic-bak | tr '\n' ' ')(copy one back with visudo -cf first if you want the old rule)"
+  [[ "$RM_TOOLS" == yes ]] || echo "  Toolchains kept: /usr/local/go, /opt/rust, /opt/ms-playwright and the global npm tools."
+  echo "  Open shells still have the old PATH and settings; log out and back in."
+}
+
+# ── Command line ────────────────────────────────────────────────────────────
+# One optional argument. Anything else stops with the usage text, so a typo
+# such as --uninstal can never start a full install by mistake.
+usage() {
+  cat <<USAGE
+Usage: sudo bash Claude_Code_Lubuntu_Deployer.sh [--uninstall | --help]
+
+  (no option)    Asks a few questions, then sets up this machine. Safe to run again:
+                 installed parts are skipped and your settings are kept.
+  --uninstall    Removes what this script set up. Asks before removing toolchains,
+                 apt software or the Claude user's data; keeps the user account.
+  --help, -h     Show this text.
+USAGE
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
 # Order matters: logging starts only after the prompts, so passwords typed at
 # get_config never reach the log; everything after that is captured.
 main() {
+  [[ $# -le 1 ]] || { usage >&2; error "Give at most one option."; }
+  case "${1:-}" in
+    "") ;;                                   # normal install, below
+    --uninstall) header; uninstall; exit 0 ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           usage >&2; error "Unknown option: $1" ;;
+  esac
   header
   preflight
   get_config
